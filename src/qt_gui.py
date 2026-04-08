@@ -4,7 +4,10 @@
 import sys
 import os
 import json
+import argparse
 import logging
+import threading
+import faulthandler
 from pathlib import Path
 import traceback
 
@@ -36,6 +39,136 @@ from analyzer import CDAAnalyzer
 from weather import WeatherService
 from config import DEFAULT_PARAMETERS
 
+_CRASH_APP = None
+_CRASH_LOG_PATH = Path.cwd() / "cda_analyzer_crash.log"
+_STAGE_LOG_PATH = Path.cwd() / "cda_analyzer_stage.log"
+_FILE_LOG_ENABLED = False
+
+
+def _append_crash_log(message):
+    """Best-effort append to crash log file."""
+    if not _FILE_LOG_ENABLED:
+        return
+    try:
+        with _CRASH_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(message + "\n")
+    except Exception:
+        pass
+
+
+def _mark_stage(stage):
+    """Persist last known execution stage for native crash diagnostics."""
+    if not _FILE_LOG_ENABLED:
+        return
+    try:
+        with _STAGE_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(stage + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except Exception:
+        pass
+
+
+def _show_fatal_dialog(title, message):
+    """Show a fatal error dialog if QApplication is available."""
+    try:
+        if _CRASH_APP is not None:
+            QMessageBox.critical(None, title, message)
+    except Exception:
+        pass
+
+
+def _python_excepthook(exc_type, exc_value, exc_tb):
+    """Handle uncaught exceptions from Python main thread."""
+    tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    text = f"[UNCAUGHT PYTHON EXCEPTION]\n{tb}"
+    _append_crash_log(text)
+    _logger.critical(text)
+    extra = f"\n\nSee log: {_CRASH_LOG_PATH}" if _FILE_LOG_ENABLED else ""
+    _show_fatal_dialog("Unhandled Error", f"An unexpected error occurred.\n\n{exc_value}{extra}")
+
+
+def _threading_excepthook(args):
+    """Handle uncaught exceptions from Python threads."""
+    tb = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+    text = f"[UNCAUGHT THREAD EXCEPTION] thread={args.thread.name}\n{tb}"
+    _append_crash_log(text)
+    _logger.critical(text)
+    extra = f"\n\nSee log: {_CRASH_LOG_PATH}" if _FILE_LOG_ENABLED else ""
+    _show_fatal_dialog("Background Thread Error", f"A background thread crashed.\n\n{args.exc_value}{extra}")
+
+
+def _qt_message_handler(mode, context, message):
+    """Capture Qt warnings/errors that may not raise Python exceptions."""
+    # Never let exceptions escape a Qt message handler.
+    # Escaping here can terminate the process without a Python traceback.
+    try:
+        try:
+            mode_name = {
+                0: "QtDebugMsg",
+                1: "QtWarningMsg",
+                2: "QtCriticalMsg",
+                3: "QtFatalMsg",
+                4: "QtInfoMsg",
+            }.get(int(mode), f"QtMsg({int(mode)})")
+        except Exception:
+            mode_name = "QtMsg"
+
+        text = f"[{mode_name}] {message}"
+        _append_crash_log(text)
+    except Exception:
+        pass
+
+
+def _install_global_error_reporting(app, enable_file_log=False, crash_log_path=None):
+    """Install global hooks so crashes always leave a report."""
+    global _CRASH_APP, _FILE_LOG_ENABLED, _CRASH_LOG_PATH, _STAGE_LOG_PATH
+    _CRASH_APP = app
+    _FILE_LOG_ENABLED = bool(enable_file_log)
+
+    if crash_log_path:
+        _CRASH_LOG_PATH = Path(crash_log_path)
+        _STAGE_LOG_PATH = _CRASH_LOG_PATH.with_name(_CRASH_LOG_PATH.stem + "_stage.log")
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    if _FILE_LOG_ENABLED:
+        # Ensure logging has a persistent file sink.
+        has_file_handler = any(
+            isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == str(_CRASH_LOG_PATH)
+            for h in root_logger.handlers
+        )
+        if not has_file_handler:
+            file_handler = logging.FileHandler(_CRASH_LOG_PATH, encoding="utf-8")
+            file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+            root_logger.addHandler(file_handler)
+
+    # Dump Python fault traces (segfaults, aborts) where possible.
+    try:
+        if _FILE_LOG_ENABLED:
+            crash_file = _CRASH_LOG_PATH.open("a", encoding="utf-8")
+            faulthandler.enable(crash_file, all_threads=True)
+        else:
+            faulthandler.enable(all_threads=True)
+    except Exception as e:
+        _append_crash_log(f"[WARN] Could not enable faulthandler: {e}")
+
+    # Python-level uncaught exceptions.
+    sys.excepthook = _python_excepthook
+    try:
+        threading.excepthook = _threading_excepthook
+    except Exception:
+        pass
+
+    # Qt-level warnings/errors are redirected only when file logging is enabled.
+    if _FILE_LOG_ENABLED:
+        try:
+            from PyQt5.QtCore import qInstallMessageHandler
+            qInstallMessageHandler(_qt_message_handler)
+        except Exception as e:
+            _append_crash_log(f"[WARN] Could not install Qt message handler: {e}")
+
 class WorkerThread(QThread):
     """Background thread for analysis"""
     finished = pyqtSignal(object, str, object)  # results, error, preprocessed_segments
@@ -48,14 +181,20 @@ class WorkerThread(QThread):
 
     def run(self):
         try:
+            _mark_stage("worker:run:start")
             # Preprocess the ride data first
             preprocessed_segments = self.analyzer.preprocess_ride_data(self.ride_data, self.weather_service)
+            _mark_stage("worker:run:after_preprocess")
             # Then analyze with the preprocessed segments
             results = self.analyzer.analyze_ride(self.ride_data, self.weather_service, preprocessed_segments)
+            _mark_stage("worker:run:after_analyze")
             self.finished.emit(results, None, preprocessed_segments)
         except Exception as e:
-            traceback.print_exc()
-            self.finished.emit(None, str(e), None)
+            _mark_stage("worker:run:exception")
+            tb = traceback.format_exc()
+            _append_crash_log(f"[WORKER EXCEPTION]\n{tb}")
+            _logger.exception("Worker thread failed")
+            self.finished.emit(None, f"{e}\n\n{tb}", None)
 
 class CustomProgress(QProgressBar):
     def __init__(self, *args, **kwargs):
@@ -169,6 +308,7 @@ class GUIInterface(QMainWindow):
         self.current_canvas = None
         self.sim_figure = None
         self.sim_canvas = None
+        self.worker = None
 
         self.home_directory = os.path.expanduser('~')
         self.downloads_path = os.path.join(self.home_directory, 'Downloads')
@@ -423,8 +563,8 @@ class GUIInterface(QMainWindow):
         self.map_webview.setMinimumHeight(400)
         map_layout.addWidget(self.map_webview)
 
-        self.map_refresh_btn = QPushButton("Refresh Map")
-        self.map_refresh_btn.clicked.connect(lambda: self.map_webview.reload())
+        self.map_refresh_btn = QPushButton("Generate / Refresh Map")
+        self.map_refresh_btn.clicked.connect(self._generate_map)
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()                 
         btn_layout.addWidget(self.map_refresh_btn)
@@ -613,7 +753,15 @@ class GUIInterface(QMainWindow):
         if not self.fit_file_path:
             QMessageBox.critical(self, "Error", "Please select a FIT file first")
             return
+        if not self._can_load_new_file():
+            QMessageBox.warning(
+                self,
+                "Analysis running",
+                "Wait for the current analysis to finish before loading a new FIT file."
+            )
+            return
         try:
+            _mark_stage("ui:load_fit:start")
             self.file_status.clear()
             self.file_status.append("Loading FIT file...\n")
             QApplication.processEvents()
@@ -630,11 +778,21 @@ class GUIInterface(QMainWindow):
             self.analyzer = CDAAnalyzer(self.parameters)
             self.weather_service = WeatherService()
             self._enable_segment_parameters()
-            self._cleanup_results()
+            self._cleanup_results(full_reset=True)
             self.tabs.setCurrentWidget(self.parameters_frame)
+            _mark_stage("ui:load_fit:done")
         except Exception as e:
+            _mark_stage("ui:load_fit:exception")
             self.file_status.append(f"Error loading FIT file: {str(e)}\n")
             QMessageBox.critical(self, "Error", str(e))
+
+    def _can_load_new_file(self):
+        """Return False when analysis worker is still running.
+
+        Loading a new FIT while background analysis is active can leave Qt objects
+        in an inconsistent state and cause hard-to-reproduce crashes.
+        """
+        return not (self.worker is not None and self.worker.isRunning())
 
     def _save_parameters(self):
         try:
@@ -678,23 +836,42 @@ class GUIInterface(QMainWindow):
         canvas.setParent(None)
         canvas.deleteLater()
 
-    def _cleanup_results(self):
+    def _cleanup_results(self, full_reset=False):
         if self.summary_text:
             self.summary_text.clear()
             self.summary_text.append("Run analysis to see results here")
 
-        if self.current_canvas:
-            self._safe_delete_canvas(self.current_canvas)
-            self.current_canvas = None
-
         if self.current_figure:
-            # DO NOT close the figure before canvas is destroyed
-            self.current_figure = None
+            # Keep canvas alive and clear figure to avoid draw_idle callbacks
+            # targeting a deleted FigureCanvasQTAgg.
+            self.current_figure.clear()
+            if self.current_canvas:
+                self.current_canvas.draw()
+
+        if full_reset:
+            self.analysis_results = None
+            self.preprocessed_segments = None
+            self.simulation_results = None
+            self.segment_data_map = {}
+
+            if self.sim_summary_text:
+                self.sim_summary_text.clear()
+                self.sim_summary_text.append("Run simulation to see results here")
+
+            if self.sim_figure:
+                self.sim_figure.clear()
+                if self.sim_canvas:
+                    self.sim_canvas.draw()
+
+            if self.map_webview:
+                self.map_webview.setHtml("<html><body><p>Run analysis to display map</p></body></html>")
 
     def _run_analysis(self):
         if self.ride_data is None:
             QMessageBox.critical(self, "Error", "Please load a FIT file first")
             return
+
+        _mark_stage("ui:run_analysis:start")
 
         self._cleanup_results()
         self.summary_text.clear()
@@ -711,37 +888,81 @@ class GUIInterface(QMainWindow):
         self.worker = WorkerThread(self.analyzer, self.ride_data, self.weather_service)
         self.worker.finished.connect(self._on_analysis_complete)
         self.worker.start()
+        _mark_stage("ui:run_analysis:worker_started")
 
     def _on_analysis_complete(self, results, error, preprocessed_segments):
-        #self.progress.setVisible(False)
-        self.progress.setRange(0, 100)
-        self.progress.setValue(100)
-        self.analysis_status.setText("Analysis complete!" if not error else "Analysis failed")
+        try:
+            _mark_stage("ui:on_analysis_complete:start")
+            #self.progress.setVisible(False)
+            self.progress.setRange(0, 100)
+            self.progress.setValue(100)
+            self.analysis_status.setText("Analysis complete!" if not error else "Analysis failed")
 
-        self._disable_segment_parameters()
-        self.summary_text.clear()
+            self._disable_segment_parameters()
+            self.summary_text.clear()
 
-        if error:
-            self.summary_text.append(f"<b>Error during analysis:</b> {error}")
-            QMessageBox.critical(self, "Error", f"Analysis failed: {error}")
-            self.analysis_results = None
-            self.preprocessed_segments = None
-        else:
-            self.analysis_results = results
-            self.preprocessed_segments = preprocessed_segments
-            self._create_segment_mapping()
-            self._display_analysis_results()
+            if error:
+                _mark_stage("ui:on_analysis_complete:error")
+                self.summary_text.append(f"<b>Error during analysis:</b> {error}")
+                QMessageBox.critical(self, "Error", f"Analysis failed: {error}")
+                self.analysis_results = None
+                self.preprocessed_segments = None
+            else:
+                _mark_stage("ui:on_analysis_complete:success_path")
+                self.analysis_results = results
+                self.preprocessed_segments = preprocessed_segments
+                self._create_segment_mapping()
+                _mark_stage("ui:on_analysis_complete:after_mapping")
+                self._display_analysis_results()
+                _mark_stage("ui:on_analysis_complete:after_summary")
 
-            # 🔁 Auto-generate map and plots after analysis
-            self.tabs.setCurrentWidget(self.results_frame)
+                # Auto-generate visuals, but isolate failures so UI remains usable.
+                self.tabs.setCurrentWidget(self.results_frame)
+                self._auto_generate_visuals()
+
+                # Return to summary after auto-generation.
+                self.results_notebook.setCurrentWidget(self.summary_frame)
+                self.analysis_status.setText("Analysis complete!")
+                _mark_stage("ui:on_analysis_complete:done")
+        except Exception:
+            _mark_stage("ui:on_analysis_complete:exception")
+            tb = traceback.format_exc()
+            _append_crash_log(f"[UI CALLBACK EXCEPTION]\n{tb}")
+            _logger.exception("Unhandled exception in _on_analysis_complete")
+            extra = f"\n\nSee log: {_CRASH_LOG_PATH}" if _FILE_LOG_ENABLED else ""
+            QMessageBox.critical(self, "Unhandled Error", f"An unexpected UI error occurred.{extra}")
+
+    def _auto_generate_visuals(self):
+        """Generate map and plots automatically after analysis.
+
+        Failures are reported and logged per visual type, without aborting the
+        analysis result display.
+        """
+        _mark_stage("ui:auto_visuals:start")
+
+        # Map
+        try:
             self.results_notebook.setCurrentWidget(self.map_frame)
-            self._generate_map()  # Auto-generate map
+            self._generate_map()
+            _mark_stage("ui:auto_visuals:map_ok")
+        except Exception:
+            tb = traceback.format_exc()
+            _append_crash_log(f"[AUTO MAP EXCEPTION]\n{tb}")
+            _logger.exception("Automatic map generation failed")
+            QMessageBox.warning(self, "Map Generation Failed", "Analysis completed, but map generation failed.")
+            _mark_stage("ui:auto_visuals:map_fail")
 
+        # Plots
+        try:
             self.results_notebook.setCurrentWidget(self.plot_frame)
-            self._generate_plots()  # Auto-generate plots
-
-            # Optional: Switch back to Summary tab
-            self.results_notebook.setCurrentWidget(self.summary_frame)
+            self._generate_plots()
+            _mark_stage("ui:auto_visuals:plots_ok")
+        except Exception:
+            tb = traceback.format_exc()
+            _append_crash_log(f"[AUTO PLOTS EXCEPTION]\n{tb}")
+            _logger.exception("Automatic plot generation failed")
+            QMessageBox.warning(self, "Plot Generation Failed", "Analysis completed, but plot generation failed.")
+            _mark_stage("ui:auto_visuals:plots_fail")
 
     def _create_segment_mapping(self):
         if not self.analysis_results or self.ride_data is None:
@@ -920,14 +1141,6 @@ class GUIInterface(QMainWindow):
             QMessageBox.critical(self, "Error", "Please run analysis first")
             return
         try:
-            # Clear any existing plots first
-            if self.current_canvas:
-                self.current_canvas.deleteLater()
-                self.current_canvas = None
-            if self.current_figure:
-                plt.close(self.current_figure)
-                self.current_figure = None
-            
             segments = self.analysis_results['segments']
             if not segments:
                 QMessageBox.warning(self, "No Data", "No steady segments found for plotting.")
@@ -936,7 +1149,10 @@ class GUIInterface(QMainWindow):
             colors = self._generate_segment_colors(len(segments))
             colors_hex = [f"#{int(c[0]*255):02x}{int(c[1]*255):02x}{int(c[2]*255):02x}" for c in colors]
 
-            self.current_figure = Figure(figsize=(16, 10))
+            if self.current_figure is None:
+                self.current_figure = Figure(figsize=(16, 10))
+            else:
+                self.current_figure.clear()
             gs = self.current_figure.add_gridspec(3, 2, hspace=0.4, wspace=0.3)
 
             # --- 1. Speed vs Distance ---
@@ -1063,27 +1279,17 @@ class GUIInterface(QMainWindow):
                 right=0.98
             )
 
-            # Cleanup any existing canvas
-            #self._cleanup_results()
-            
-            # Embed new canvas with safety checks
-            try:
+            # Create canvas once; then reuse it for future draws.
+            if self.current_canvas is None:
                 self.current_canvas = FigureCanvas(self.current_figure)
-                self.current_canvas.draw()  # Initial draw
-                self.plot_label.setParent(None)
-                self.plot_button.setParent(None)
+                if self.plot_label and self.plot_label.parent() is not None:
+                    self.plot_label.setParent(None)
+                if self.plot_button and self.plot_button.parent() is not None:
+                    self.plot_button.setParent(None)
                 layout = self.plot_frame.layout()
                 layout.addWidget(self.current_canvas)
-            except RuntimeError as e:
-                if "wrapped C/C++ object" in str(e):
-                    # If the canvas was deleted, clean up and retry once
-                    self._cleanup_results()
-                    self.current_canvas = FigureCanvas(self.current_figure)
-                    self.current_canvas.draw()
-                    layout = self.plot_frame.layout()
-                    layout.addWidget(self.current_canvas)
-                else:
-                    raise
+
+            self.current_canvas.draw()
 
         except Exception as e:
             self._cleanup_results()
@@ -1259,14 +1465,6 @@ class GUIInterface(QMainWindow):
             return
         
         try:
-            # Clear any existing simulation plots
-            if self.sim_canvas:
-                self.sim_canvas.deleteLater()
-                self.sim_canvas = None
-            if self.sim_figure:
-                plt.close(self.sim_figure)
-                self.sim_figure = None
-            
             segments = self.simulation_results
             if not segments:
                 return
@@ -1274,7 +1472,10 @@ class GUIInterface(QMainWindow):
             colors = self._generate_segment_colors(len(segments))
             colors_hex = [f"#{int(c[0]*255):02x}{int(c[1]*255):02x}{int(c[2]*255):02x}" for c in colors]
 
-            self.sim_figure = Figure(figsize=(16, 10))
+            if self.sim_figure is None:
+                self.sim_figure = Figure(figsize=(16, 10))
+            else:
+                self.sim_figure.clear()
             gs = self.sim_figure.add_gridspec(3, 2, hspace=0.4, wspace=0.3)
 
             # --- 1. Speed vs Distance ---
@@ -1401,21 +1602,15 @@ class GUIInterface(QMainWindow):
                 right=0.98
             )
 
-            # Embed canvas
-            try:
+            # Create canvas once; then reuse it for future draws.
+            if self.sim_canvas is None:
                 self.sim_canvas = FigureCanvas(self.sim_figure)
-                self.sim_canvas.draw()
-                self.sim_plot_label.setParent(None)
+                if self.sim_plot_label and self.sim_plot_label.parent() is not None:
+                    self.sim_plot_label.setParent(None)
                 layout = self.sim_plot_frame.layout()
                 layout.addWidget(self.sim_canvas)
-            except RuntimeError as e:
-                if "wrapped C/C++ object" in str(e):
-                    self.sim_canvas = FigureCanvas(self.sim_figure)
-                    self.sim_canvas.draw()
-                    layout = self.sim_plot_frame.layout()
-                    layout.addWidget(self.sim_canvas)
-                else:
-                    raise
+
+            self.sim_canvas.draw()
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error generating plots: {str(e)}")
@@ -1521,9 +1716,21 @@ def create_splash(app, logo_path, text):
     app.processEvents()
     return splash
 
-def main():
+def main(argv=None):
     """Bootstrapped entry point to prevent window flicker."""
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--file-log", action="store_true", help="Enable file-based crash logging")
+    parser.add_argument("--log-file", help="Crash log file path (implies --file-log)")
+    args, _ = parser.parse_known_args(argv if argv is not None else sys.argv[1:])
+
+    enable_file_log = bool(args.file_log or args.log_file)
+
     app = QApplication(sys.argv)
+    _install_global_error_reporting(
+        app,
+        enable_file_log=enable_file_log,
+        crash_log_path=args.log_file,
+    )
 
     # Use new splash function
     logo_path = resource_path("icons/logo.PNG")
@@ -1533,12 +1740,21 @@ def main():
     def create_main_window():
         if splash:
             splash.close()
-        window = GUIInterface(app)
-        window.show()
+        # Keep a strong reference so the window is not garbage-collected.
+        app.main_window = GUIInterface(app)
+        app.main_window.show()
 
     # Delay window creation
     QTimer.singleShot(2500, create_main_window)
-    sys.exit(app.exec_())
+    try:
+        sys.exit(app.exec_())
+    except Exception:
+        tb = traceback.format_exc()
+        _append_crash_log(f"[APP LOOP EXCEPTION]\n{tb}")
+        _logger.exception("Application event loop crashed")
+        extra = f"\n\nSee log: {_CRASH_LOG_PATH}" if _FILE_LOG_ENABLED else ""
+        _show_fatal_dialog("Fatal Error", f"The application crashed unexpectedly.{extra}")
+        raise
 
 if __name__ == "__main__":
     main()

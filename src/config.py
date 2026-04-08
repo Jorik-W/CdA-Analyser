@@ -16,7 +16,7 @@ DEFAULT_PARAMETERS = {
     'bike_mass': 10.0,   # kg
     'rolling_resistance': 0.003,
     'drivetrain_loss': 0.025,
-    'wind_effect_factor' : 0.06, # (0.0 - 1.0)  look at cli angle +- 0 and angle 180 must be 0 -> +-0.20 cda diff +  CdA standard deviation < 0.05
+    'wind_effect_factor' : 0.25, # (0.0 - 1.0)  look at cli angle +- 0 and angle 180 must be 0 -> +-0.20 cda diff +  CdA standard deviation < 0.05
 
     # Sub-segment splitting: each steady segment is divided into chunks so that
     # local GPS bearing, slope and acceleration are computed per chunk rather

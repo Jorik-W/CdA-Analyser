@@ -15,7 +15,7 @@ def main():
     
     if args.gui:
         from qt_gui import main as gui_main
-        gui_main()
+        gui_main(remaining_args)
     elif args.cli:
         from cli import main as cli_main
         # Pass remaining args to CLI
@@ -25,7 +25,7 @@ def main():
         # Default to GUI if available, otherwise CLI
         try:
             from qt_gui import main as gui_main
-            gui_main()
+            gui_main(remaining_args)
         except ImportError:
             from cli import main as cli_main
             # Pass all args to CLI
