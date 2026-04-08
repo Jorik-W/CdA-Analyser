@@ -1028,13 +1028,14 @@ class GUIInterface(QMainWindow):
 
         t.append(f"Segment Analysis ({len(r['segments'])} steady segments found):")
         t.append("-" * 200)
-        t.append(f"{'ID':<3}\t{'Dur':<6}\t{'Dist':<8}\t{'Speed':<6}\t{'AirSpd':<6}\t{'Wind':<5}\t{'Angle':<6}\t{'Slope':<6}\t{'Power':<6}\t{'CdA':<7}")
+        t.append(f"{'ID':<3}\t{'Dur':>6}\t{'Dist':>8}\t{'v_g':>6}\t{'v_w':>7}\t{'v_a':>6}\t{'Angle':>6}\t{'Slope':>6}\t{'Power':>6}\t{'CdA':>7}")
+        t.append(f"{'':3}\t{'(s)':>6}\t{'(m)':>8}\t{'m/s':>6}\t{'m/s':>7}\t{'m/s':>6}\t{'(deg)':>6}\t{'(deg)':>6}\t{'(W)':>6}\t{'':>7}")
         t.append("-" * 200)
         for s in r['segments']:
             t.append(
-                f"{s['segment_id']:<3}\t{s['duration']:<6.0f}\t{s['distance']:<8.0f}\t"
-                f"{s['speed']:<6.2f}\t{s['air_speed']:<6.2f}\t{s['effective_wind']:<5.1f}\t"
-                f"{s['wind_angle']:<6.0f}\t{s['slope']:<6.1f}\t{s['power']:<6.0f}\t{s['cda']:<7.4f}"
+                f"{s['segment_id']:<3}\t{s['duration']:>6.0f}\t{s['distance']:>8.0f}\t"
+                f"{s.get('v_ground', s['speed']):>6.2f}\t{s.get('v_wind', s['effective_wind']):>+7.2f}\t{s.get('v_air', s['air_speed']):>6.2f}\t"
+                f"{s['wind_angle']:>6.0f}\t{s['slope']:>6.1f}\t{s['power']:>6.0f}\t{s['cda']:>7.4f}"
             )
         t.append("\nSummary:")
         t.append("-" * 100)
@@ -1052,7 +1053,10 @@ class GUIInterface(QMainWindow):
             if s.get('wind_coefficients'):
                 a, b, c = s['wind_coefficients']
                 t.append(f"Wind Angle Formula: CdA = {a:.2e}*θ² + {b:.2e}*θ + {c:.2e}")
-            t.append(f"Average air speed: {s['avg_air_speed']:.2f} m/s")
+            t.append(f"Average wind speed (meteo): {s['avg_wind_speed']:.1f} m/s")
+            t.append(f"Average ground speed  v_g: {s.get('avg_ground_speed', 0):.2f} m/s")
+            t.append(f"Average wind component v_w: {s.get('avg_wind_component', 0):+.2f} m/s  (+headwind / -tailwind)")
+            t.append(f"Average air speed      v_a: {s['avg_air_speed']:.2f} m/s")
             t.append(f"Total analysis duration: {s['total_duration']:.0f} seconds")
             t.append(f"Total distance analyzed: {s['total_distance']:.0f} meters")
             t.append("")
@@ -1445,17 +1449,18 @@ class GUIInterface(QMainWindow):
         # --- Segment Table Header ---
         t.append(f"Segment Results ({len(self.simulation_results)} segments):")
         t.append("-" * 200)
-        t.append(f"{'ID':<3}\t{'Dur':<6}\t{'Dist':<8}\t{'Speed':<6}\t"
-                f"{'AirSpd':<6}\t{'Wind':<5}\t{'Angle':<6}\t"
-                f"{'Slope':<6}\t{'Power':<6}\t{'CdA':<7}")
+        t.append(f"{'ID':<3}\t{'Dur':>6}\t{'Dist':>8}\t{'v_g':>6}\t{'v_w':>7}\t{'v_a':>6}\t"
+                f"{'Angle':>6}\t{'Slope':>6}\t{'Power':>6}\t{'CdA':>7}")
+        t.append(f"{'':3}\t{'(s)':>6}\t{'(m)':>8}\t{'m/s':>6}\t{'m/s':>7}\t{'m/s':>6}\t"
+                f"{'(deg)':>6}\t{'(deg)':>6}\t{'(W)':>6}\t{'':>7}")
         t.append("-" * 200)
 
         # --- Segment Rows ---
         for s in self.simulation_results:
             t.append(
-                f"{s['segment_id']:<3}\t{s['duration']:<6.0f}\t{s['distance']:<8.0f}\t"
-                f"{s['speed']:<6.2f}\t{s['air_speed']:<6.2f}\t{s['effective_wind']:<5.1f}\t"
-                f"{s['wind_angle']:<6.0f}\t{s['slope']:<6.1f}\t{s['power']:<6.0f}\t{s['cda']:<7.4f}"
+                f"{s['segment_id']:<3}\t{s['duration']:>6.0f}\t{s['distance']:>8.0f}\t"
+                f"{s.get('v_ground', s['speed']):>6.2f}\t{s.get('v_wind', s['effective_wind']):>+7.2f}\t{s.get('v_air', s['air_speed']):>6.2f}\t"
+                f"{s['wind_angle']:>6.0f}\t{s['slope']:>6.1f}\t{s['power']:>6.0f}\t{s['cda']:>7.4f}"
             )
 
         # --- Summary Section ---

@@ -216,6 +216,10 @@ class CDAAnalyzer:
             {'air_speed': wavg('air_speed')},
         )
 
+        v_ground = averages['speed']
+        v_wind   = wavg('effective_wind')
+        v_air    = wavg('air_speed')
+
         return {
             'cda':          final_cda,
             'cda_std':      cda_std,
@@ -224,10 +228,15 @@ class CDAAnalyzer:
             'duration':     self._get_segment_duration(segment_df),
             'distance':     self._get_segment_distance(segment_df),
             'air_density':  env_conditions['air_density'],
-            'effective_wind': wavg('effective_wind'),
-            'air_speed':    wavg('air_speed'),
+            # Three explicit speeds: ground / wind-component / air
+            'v_ground':     v_ground,   # GPS ground speed (m/s)
+            'v_wind':       v_wind,     # wind component along travel (+headwind, m/s)
+            'v_air':        v_air,      # air speed = v_ground + v_wind (m/s)
+            # Legacy aliases kept for backward compatibility
+            'effective_wind': v_wind,
+            'air_speed':    v_air,
             'wind_angle':   avg_wind_angle,
-            'subsegments':  sub_results,   # hidden detail; available for debugging
+            'subsegments':  sub_results,
             **averages,
         }
     
@@ -770,12 +779,13 @@ class CDAAnalyzer:
             effective_wind = 0.0
 
         air_speed = speed + effective_wind
-        
-        if abs(air_speed) <= 0.1:  # Avoid very small values
+
+        if speed <= 0.1 or abs(air_speed) <= 0.1:  # Avoid division by near-zero
             return None
-        
+
         try:
-            cda = (2 * aero_power) / (air_density * abs(air_speed)**3)
+            # P_aero = 0.5 * rho * CdA * v_air^2 * v_ground  →  CdA = 2*P / (rho * v_air^2 * v_g)
+            cda = (2 * aero_power) / (air_density * air_speed ** 2 * speed)
             return cda if 0.0 <= cda <= 1.0 else None  # Reasonable range check
         except Exception:
             return None
@@ -819,6 +829,11 @@ class CDAAnalyzer:
         
         self.logger.info(f"Segment analysis complete - CdA: {final_cda:.4f} ± {cda_std:.4f}")
         
+        wind_effects = power_components['wind_effects']
+        v_ground = segment_averages['speed']
+        v_wind   = wind_effects['effective_wind']
+        v_air    = wind_effects['air_speed']
+
         return {
             'cda': final_cda,
             'cda_std': cda_std,
@@ -827,8 +842,15 @@ class CDAAnalyzer:
             'duration': self._get_segment_duration(segment_df),
             'distance': self._get_segment_distance(segment_df),
             'air_density': env_conditions['air_density'],
+            # Three explicit speeds
+            'v_ground':     v_ground,
+            'v_wind':       v_wind,
+            'v_air':        v_air,
+            # Legacy aliases
+            'effective_wind': v_wind,
+            'air_speed':    v_air,
             **segment_averages,
-            **power_components['wind_effects']
+            **wind_effects,
         }
     
     def _calculate_segment_averages(self, averaged_data, power_components):
@@ -847,11 +869,12 @@ class CDAAnalyzer:
     
     def _calculate_residual(self, averages, cda, env_conditions, wind_effects):
         """Calculate power residual for quality assessment"""
+        # P_aero = 0.5 * rho * CdA * v_air^2 * v_ground  (consistent with _calculate_single_cda)
         calculated_power = (
-            averages['rolling_power'] + 
-            averages['gradient_power'] + 
-            averages['inertial_power'] + 
-            0.5 * env_conditions['air_density'] * cda * abs(wind_effects['air_speed'])**3
+            averages['rolling_power'] +
+            averages['gradient_power'] +
+            averages['inertial_power'] +
+            0.5 * env_conditions['air_density'] * cda * wind_effects['air_speed'] ** 2 * averages['speed']
         ) / self._drivetrain_efficiency
         
         return abs(calculated_power - averages['power'])
@@ -1106,7 +1129,10 @@ class CDAAnalyzer:
             'total_duration': sum(s['duration'] for s in segment_results),
             'total_distance': sum(s['distance'] for s in segment_results),
             'avg_wind_speed': float(np.mean(wind_speeds)) if wind_speeds else 0.0,
-            'avg_air_speed': np.mean([s.get('air_speed', 0) for s in segment_results]),
+            # Three speed averages across all segments
+            'avg_ground_speed':   float(np.mean([s.get('v_ground', s.get('speed', 0))   for s in segment_results])),
+            'avg_wind_component': float(np.mean([s.get('v_wind',   s.get('effective_wind', 0)) for s in segment_results])),
+            'avg_air_speed':      float(np.mean([s.get('v_air',    s.get('air_speed', 0)) for s in segment_results])),
             'avg_acceleration': np.mean([s['acceleration'] for s in segment_results]),
             'avg_temp': float(np.mean(temperatures)) if temperatures else float('nan'),
             'avg_press': float(np.mean(pressures)) if pressures else float('nan'),

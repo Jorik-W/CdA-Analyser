@@ -107,21 +107,22 @@ def _display_results(results):
     
     # Print segment results
     print(f"\nSegment Analysis ({len(results['segments'])} steady segments found):")
-    print("-" * 130)
-    print(f"{'ID':<3} {'Dur':<6} {'Dist':<8} {'Speed':<6} {'AirSpd':<6} {'Wind':<5} {'Angle':<6} {'Slope':<6} {'Power':<6} {'CdA':<7}")
-    print("-" * 130)
-    
+    print("-" * 140)
+    print(f"{'ID':<3} {'Dur':>6} {'Dist':>8} {'v_g':>6} {'v_w':>6} {'v_a':>6} {'Angle':>6} {'Slope':>6} {'Power':>6} {'CdA':>7}")
+    print(f"{'':3} {'(s)':>6} {'(m)':>8} {'(m/s)':>6} {'(m/s)':>6} {'(m/s)':>6} {'(deg)':>6} {'(deg)':>6} {'(W)':>6} {'':>7}")
+    print("-" * 140)
+
     for segment in results['segments']:
         print(f"{segment['segment_id']:<3} "
-              f"{segment['duration']:<6.0f} "
-              f"{segment['distance']:<8.0f} "
-              f"{segment['speed']:<6.2f} "
-              f"{segment['air_speed']:<6.2f} "
-              f"{segment['effective_wind']:<5.1f} "
-              f"{segment['wind_angle']:<6.0f} "
-              f"{segment['slope']:<6.1f} "
-              f"{segment['power']:<6.0f} "
-              f"{segment['cda']:<7.4f} ")
+              f"{segment['duration']:>6.0f} "
+              f"{segment['distance']:>8.0f} "
+              f"{segment.get('v_ground', segment['speed']):>6.2f} "
+              f"{segment.get('v_wind', segment['effective_wind']):>+6.2f} "
+              f"{segment.get('v_air', segment['air_speed']):>6.2f} "
+              f"{segment['wind_angle']:>6.0f} "
+              f"{segment['slope']:>6.1f} "
+              f"{segment['power']:>6.0f} "
+              f"{segment['cda']:>7.4f} ")
     
     # Print summary
     print("\nSummary:")
@@ -142,8 +143,10 @@ def _display_results(results):
         else:
             print("Wind Angle Formula: Insufficient data")
 
-        print(f"Average wind speed: {summary['avg_wind_speed']:.1f} m/s")
-        print(f"Average air speed: {summary['avg_air_speed']:.2f} m/s")
+        print(f"Average wind speed (meteo): {summary['avg_wind_speed']:.1f} m/s")
+        print(f"Average ground speed (v_g): {summary.get('avg_ground_speed', 0):.2f} m/s")
+        print(f"Average wind component (v_w): {summary.get('avg_wind_component', 0):+.2f} m/s  (+headwind / -tailwind)")
+        print(f"Average air speed (v_a): {summary['avg_air_speed']:.2f} m/s")
         print(f"Total analysis duration: {summary['total_duration']:.0f} seconds")
         print(f"Total distance analyzed: {summary['total_distance']:.0f} meters")
     else:
