@@ -28,8 +28,10 @@ def main():
     print(f"Parsing FIT file: {args.fit_file}")
     fit_parser = FITParser()
     try:
-        df = fit_parser.parse_fit_file(args.fit_file)
+        use_elev_api = parameters.get('use_open_elevation_api', False)
+        df = fit_parser.parse_fit_file(args.fit_file, use_elev_api)
         print(f"Successfully parsed {len(df)} data points")
+        print(f"Elevation source: {fit_parser.elevation_source}")
     except Exception as e:
         print(f"Error parsing FIT file: {e}")
         sys.exit(1)
@@ -37,6 +39,7 @@ def main():
     # Analyze ride
     print("Analyzing ride data...")
     analyzer = CDAAnalyzer(parameters)
+    analyzer.elevation_source = fit_parser.elevation_source
     weather_service = WeatherService()
 
     while True:
@@ -130,6 +133,7 @@ def _display_results(results):
     summary = results['summary']
     if summary:
         print(f"Total segments analyzed: {summary['total_segments']}")
+        print(f"GPS coords: {'Yes' if summary.get('has_gps_coordinates', False) else 'No'}  |  Elev source: {summary.get('elevation_source', 'Unknown')}")
         keep_percent = summary.get('keep_percent', results.get('parameters', {}).get('cda_keep_percent', 80.0))
         kept_used = summary.get('kept_segments_used', summary['total_segments'])
         print(f"Weighted CdA (all segments): {summary.get('weighted_cda_all', summary['weighted_cda']):.4f}")

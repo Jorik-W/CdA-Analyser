@@ -16,6 +16,7 @@ class CDAAnalyzer:
         self._total_mass = self.parameters['rider_mass'] + self.parameters['bike_mass']
         self._drivetrain_efficiency = 1.0 - self.parameters['drivetrain_loss']  # 3% drivetrain loss
         self.weather_cache = {}
+        self.elevation_source = None  # Track elevation source (FIT file or Open-Elevation API)
 
     def update_parameters(self, new_parameters):
         """Update analyzer parameters"""
@@ -39,6 +40,14 @@ class CDAAnalyzer:
         
         segment_results = self._analyze_segments(segments)
         summary = self._calculate_summary(segment_results)
+
+        has_gps = (
+            'latitude' in df.columns and
+            'longitude' in df.columns and
+            len(df[['latitude', 'longitude']].dropna()) > 0
+        )
+        if summary:
+            summary['has_gps_coordinates'] = bool(has_gps)
 
         ride_info = self._extract_ride_info(df)
         if summary and ride_info is not None:  # empty dict is falsy — avoids KeyError in GUI
@@ -300,7 +309,7 @@ class CDAAnalyzer:
             altitude_diff = df['altitude'].diff()
             
             slope_rad = np.where(
-                (distance_diff > 1) & (distance_diff.notna()),
+                (distance_diff > 0) & (distance_diff.notna()) & (altitude_diff.notna()),
                 np.arctan2(altitude_diff, distance_diff), 
                 0
             )
@@ -546,7 +555,7 @@ class CDAAnalyzer:
         effective_powers = powers * self._drivetrain_efficiency
         
         # Calculate individual power components
-        rolling_powers = self._calculate_rolling_power(speeds)
+        rolling_powers = self._calculate_rolling_power(speeds, slopes)
         gradient_powers = self._calculate_gradient_power(speeds, slopes)
         inertial_powers = self._calculate_inertial_power(speeds, accelerations)
         
@@ -571,9 +580,12 @@ class CDAAnalyzer:
             'wind_effects': wind_effects
         }
     
-    def _calculate_rolling_power(self, speeds):
+    def _calculate_rolling_power(self, speeds, slopes=None):
         """Calculate rolling resistance power"""
+        if slopes is None:
+            slopes = 0.0
         return (self._total_mass * 9.81 * 
+                np.cos(np.radians(slopes)) *
                 speeds * self.parameters['rolling_resistance'])
     
     def _calculate_gradient_power(self, speeds, slopes):
@@ -745,7 +757,7 @@ class CDAAnalyzer:
         slopes = averaged_data['slopes']
 
         # Calculate individual force components
-        rolling_force = self._total_mass * 9.81 * self.parameters['rolling_resistance']
+        rolling_force = self._total_mass * 9.81 * self.parameters['rolling_resistance'] * np.cos(np.radians(slopes))
         gradient_force = self._total_mass * 9.81 * np.sin(np.radians(slopes))
         inertial_force = self._total_mass * accelerations
 
@@ -909,10 +921,16 @@ class CDAAnalyzer:
             result = self.calculate_cda_for_segment(segment, weather_data)
             
             if result:
+                start_elev = float(segment['altitude'].iloc[0]) if 'altitude' in segment.columns and not segment['altitude'].isna().all() else None
+                start_elev_fit = float(segment['altitude_fit'].iloc[0]) if 'altitude_fit' in segment.columns and not segment['altitude_fit'].isna().all() else None
+                start_elev_api = float(segment['altitude_api'].iloc[0]) if 'altitude_api' in segment.columns and not segment['altitude_api'].isna().all() else None
                 result.update({
                     'segment_id': i,
                     'start_time': segment['timestamp'].iloc[0],
-                    'end_time': segment['timestamp'].iloc[-1]
+                    'end_time': segment['timestamp'].iloc[-1],
+                    'start_elevation': start_elev,
+                    'start_elevation_fit': start_elev_fit,
+                    'start_elevation_api': start_elev_api,
                 })
                 if weather_data:
                     result['temperature'] = weather_data.get('temperature')
@@ -1136,7 +1154,10 @@ class CDAAnalyzer:
             'avg_acceleration': np.mean([s['acceleration'] for s in segment_results]),
             'avg_temp': float(np.mean(temperatures)) if temperatures else float('nan'),
             'avg_press': float(np.mean(pressures)) if pressures else float('nan'),
-            'avg_wind_direction': avg_wind_direction
+            'avg_wind_direction': avg_wind_direction,
+            # Data source tracking
+            'elevation_source': self.elevation_source,
+            'has_gps_coordinates': False  # Set in analyze_ride from input data
         }
         
         self.logger.debug(

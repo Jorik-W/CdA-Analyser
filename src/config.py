@@ -19,6 +19,7 @@ DEFAULT_PARAMETERS = {
     'rolling_resistance': 0.003,
     'drivetrain_loss': 0.025,
     'wind_effect_factor' : 0.25, # (0.0 - 1.0)  look at cli angle +- 0 and angle 180 must be 0 -> +-0.20 cda diff +  CdA standard deviation < 0.05
+    'use_open_elevation_api': False,  # Use Open-Elevation API for altitude data (batch request, all points in 1 call)
 
     # Sub-segment splitting: each steady segment is divided into chunks so that
     # local GPS bearing, slope and acceleration are computed per chunk rather
@@ -28,6 +29,9 @@ DEFAULT_PARAMETERS = {
 # Weather API settings
 OPEN_METEO_URL_FORCAST = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_URL_ARCIVE  = "https://archive-api.open-meteo.com/v1/archive"
+
+# Elevation API settings
+OPEN_ELEVATION_URL = "https://api.open-elevation.com/api/v1/lookup"
 
 """
 Eeklo

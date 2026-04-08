@@ -27,7 +27,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QPushButton, QTextEdit, QLineEdit,
     QFileDialog, QMessageBox, QProgressBar, QScrollArea,
-    QSplashScreen, QGridLayout, QFrame, QDialog, QSlider, QSpinBox
+    QSplashScreen, QGridLayout, QFrame, QDialog, QSlider, QSpinBox, QCheckBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl, QTimer, QRect, QByteArray
 from PyQt5.QtGui import QFont, QIcon, QPixmap, QPainter, QBrush, QLinearGradient, QColor
@@ -173,6 +173,7 @@ def _install_global_error_reporting(app, enable_file_log=False, crash_log_path=N
 class WorkerThread(QThread):
     """Background thread for analysis"""
     finished = pyqtSignal(object, str, object)  # results, error, preprocessed_segments
+    status = pyqtSignal(str)
 
     def __init__(self, analyzer, ride_data, weather_service):
         super().__init__()
@@ -180,9 +181,49 @@ class WorkerThread(QThread):
         self.ride_data = ride_data
         self.weather_service = weather_service
 
+    def _emit_status(self, message):
+        self.status.emit(message)
+        _logger.info(message)
+
+    def _prepare_elevation_for_analysis(self):
+        use_api = bool(self.analyzer.parameters.get('use_open_elevation_api', False))
+
+        if not use_api:
+            if 'altitude_fit' in self.ride_data.columns:
+                self.ride_data['altitude'] = self.ride_data['altitude_fit']
+            self.analyzer.elevation_source = 'FIT file'
+            self._emit_status("Elevation API disabled: using FIT altitude")
+            return
+
+        if 'latitude' not in self.ride_data.columns or 'longitude' not in self.ride_data.columns:
+            self.analyzer.elevation_source = 'FIT file (no GPS coordinates)'
+            self._emit_status("Elevation API debug: no GPS columns, using FIT altitude")
+            return
+
+        if 'altitude_api' in self.ride_data.columns and self.ride_data['altitude_api'].notna().any():
+            self.ride_data['altitude'] = self.ride_data['altitude_api']
+            self.analyzer.elevation_source = 'Open-Elevation API (cached)'
+            self._emit_status("Elevation API: using cached values from previous analysis")
+            return
+
+        self._emit_status("Elevation API: fetching elevations at analysis start...")
+        fit_parser = FITParser()
+        self.ride_data = fit_parser.apply_open_elevation_to_dataframe(
+            self.ride_data,
+            status_callback=self._emit_status,
+        )
+        self.analyzer.elevation_source = fit_parser.elevation_source
+
+        api_points = int(self.ride_data['altitude_api'].notna().sum()) if 'altitude_api' in self.ride_data.columns else 0
+        self._emit_status(
+            f"Elevation API done: source={self.analyzer.elevation_source}, api_points={api_points}/{len(self.ride_data)}"
+        )
+
     def run(self):
         try:
             _mark_stage("worker:run:start")
+            self._prepare_elevation_for_analysis()
+            _mark_stage("worker:run:after_elevation")
             # Preprocess the ride data first
             preprocessed_segments = self.analyzer.preprocess_ride_data(self.ride_data, self.weather_service)
             _mark_stage("worker:run:after_preprocess")
@@ -475,6 +516,7 @@ class GUIInterface(QMainWindow):
         scroll_layout.setContentsMargins(0, 0, 0, 0)  # Optional: remove inner padding
 
         self.param_entries = {}
+        self.param_checkboxes = {}
         for key, value in self.parameters.items():
             row = QHBoxLayout()
             row.setSpacing(10)  # Optional: small spacing within the row
@@ -482,14 +524,22 @@ class GUIInterface(QMainWindow):
 
             label = QLabel(key.replace('_', ' ').title())
             label.setFixedWidth(200)
-            entry = QLineEdit(str(value))
-            entry.setFixedWidth(150)
-            self.param_entries[key] = entry
+            
+            # Handle boolean parameters as checkboxes
+            if isinstance(value, bool):
+                checkbox = QCheckBox()
+                checkbox.setChecked(value)
+                self.param_checkboxes[key] = checkbox
+                row.addWidget(label)
+                row.addWidget(checkbox)
+            else:
+                entry = QLineEdit(str(value))
+                entry.setFixedWidth(150)
+                self.param_entries[key] = entry
+                row.addWidget(label)
+                row.addWidget(entry)
 
-            row.addWidget(label)
-            row.addWidget(entry)
             row.addStretch()
-
             scroll_layout.addLayout(row)
 
         scroll_layout.addStretch()
@@ -769,16 +819,22 @@ class GUIInterface(QMainWindow):
             self.file_status.append("Loading FIT file...\n")
             QApplication.processEvents()
 
+            # Save current parameters from UI (including checkbox state) BEFORE loading
+            self._save_parameters()
+
             fit_parser = FITParser()
-            self.ride_data = fit_parser.parse_fit_file(self.fit_file_path)
+            self.ride_data = fit_parser.parse_fit_file(self.fit_file_path, False)
+            elev_source = fit_parser.elevation_source
             self.file_status.append(f"Successfully loaded {len(self.ride_data)} data points\n")
+            if self.parameters.get('use_open_elevation_api', False):
+                self.file_status.append("Open-Elevation API is enabled and will be called at analysis start\n")
             cols = ', '.join(self.ride_data.columns[:10])
             self.file_status.append(f"Columns: {cols}\n")
             if len(self.ride_data.columns) > 10:
                 self.file_status.append(f"... and {len(self.ride_data.columns) - 10} more\n")
 
-            self.parameters = DEFAULT_PARAMETERS.copy()
             self.analyzer = CDAAnalyzer(self.parameters)
+            self.analyzer.elevation_source = elev_source
             self.weather_service = WeatherService()
             self._enable_segment_parameters()
             self._cleanup_results(full_reset=True)
@@ -809,6 +865,10 @@ class GUIInterface(QMainWindow):
                 else:
                     self.parameters[key] = value
             
+            # Handle checkboxes for boolean parameters
+            for key, checkbox in self.param_checkboxes.items():
+                self.parameters[key] = checkbox.isChecked()
+            
             # Update slider if wind_effect_factor changed
             if 'wind_effect_factor' in self.parameters:
                 factor_value = self.parameters['wind_effect_factor']
@@ -824,11 +884,15 @@ class GUIInterface(QMainWindow):
         for i, key in enumerate(list(self.parameters.keys())[:8]):
             if key in self.param_entries:
                 self.param_entries[key].setEnabled(False)
+            if key in self.param_checkboxes:
+                self.param_checkboxes[key].setEnabled(False)
 
     def _enable_segment_parameters(self):
         for i, key in enumerate(list(self.parameters.keys())[:8]):
             if key in self.param_entries:
                 self.param_entries[key].setEnabled(True)
+            if key in self.param_checkboxes:
+                self.param_checkboxes[key].setEnabled(True)
 
     def _safe_delete_canvas(self, canvas):
         if canvas is None:
@@ -889,9 +953,17 @@ class GUIInterface(QMainWindow):
 
         # Run in thread
         self.worker = WorkerThread(self.analyzer, self.ride_data, self.weather_service)
+        self.worker.status.connect(self._on_worker_status)
         self.worker.finished.connect(self._on_analysis_complete)
         self.worker.start()
         _mark_stage("ui:run_analysis:worker_started")
+
+    def _on_worker_status(self, message):
+        self.analysis_status.setText(message)
+        if self.summary_text:
+            self.summary_text.append(message)
+        if self.file_status:
+            self.file_status.append(message)
 
     def _on_analysis_complete(self, results, error, preprocessed_segments):
         try:
@@ -1027,16 +1099,32 @@ class GUIInterface(QMainWindow):
             t.append(f"  Average wind direction: {avg_dir:.2f} °" if avg_dir is not None and not (isinstance(avg_dir, float) and avg_dir != avg_dir) else "  Average wind direction: N/A")
 
         t.append(f"Segment Analysis ({len(r['segments'])} steady segments found):")
-        t.append("-" * 200)
-        t.append(f"{'ID':<3}\t{'Dur':>6}\t{'Dist':>8}\t{'v_g':>6}\t{'v_w':>7}\t{'v_a':>6}\t{'Angle':>6}\t{'Slope':>6}\t{'Power':>6}\t{'CdA':>7}")
-        t.append(f"{'':3}\t{'(s)':>6}\t{'(m)':>8}\t{'m/s':>6}\t{'m/s':>7}\t{'m/s':>6}\t{'(deg)':>6}\t{'(deg)':>6}\t{'(W)':>6}\t{'':>7}")
-        t.append("-" * 200)
+        t.append("-" * 250)
+        use_api = self.parameters.get('use_open_elevation_api', False)
+        if use_api:
+            t.append(f"{'ID':<3}\t{'Dur':>6}\t{'Dist':>8}\t{'Elev FIT':>8}\t{'Elev API':>8}\t{'v_g':>6}\t{'v_w':>7}\t{'v_a':>6}\t{'Angle':>6}\t{'Slope':>6}\t{'Power':>6}\t{'CdA':>7}")
+            t.append(f"{'':3}\t{'(s)':>6}\t{'(m)':>8}\t{'(m)':>8}\t{'(m)':>8}\t{'m/s':>6}\t{'m/s':>7}\t{'m/s':>6}\t{'(deg)':>6}\t{'(deg)':>6}\t{'(W)':>6}\t{'':>7}")
+        else:
+            t.append(f"{'ID':<3}\t{'Dur':>6}\t{'Dist':>8}\t{'Elev':>6}\t{'v_g':>6}\t{'v_w':>7}\t{'v_a':>6}\t{'Angle':>6}\t{'Slope':>6}\t{'Power':>6}\t{'CdA':>7}")
+            t.append(f"{'':3}\t{'(s)':>6}\t{'(m)':>8}\t{'(m)':>6}\t{'m/s':>6}\t{'m/s':>7}\t{'m/s':>6}\t{'(deg)':>6}\t{'(deg)':>6}\t{'(W)':>6}\t{'':>7}")
+        t.append("-" * 250)
+        s = r['summary'] if r.get('summary') else {}
         for s in r['segments']:
-            t.append(
-                f"{s['segment_id']:<3}\t{s['duration']:>6.0f}\t{s['distance']:>8.0f}\t"
-                f"{s.get('v_ground', s['speed']):>6.2f}\t{s.get('v_wind', s['effective_wind']):>+7.2f}\t{s.get('v_air', s['air_speed']):>6.2f}\t"
-                f"{s['wind_angle']:>6.0f}\t{s['slope']:>6.1f}\t{s['power']:>6.0f}\t{s['cda']:>7.4f}"
-            )
+            if use_api:
+                fit_str = f"{s['start_elevation_fit']:>8.0f}" if s.get('start_elevation_fit') is not None else f"{'N/A':>8}"
+                api_str = f"{s['start_elevation_api']:>8.0f}" if s.get('start_elevation_api') is not None else f"{'N/A':>8}"
+                t.append(
+                    f"{s['segment_id']:<3}\t{s['duration']:>6.0f}\t{s['distance']:>8.0f}\t"
+                    f"{fit_str}\t{api_str}\t{s.get('v_ground', s['speed']):>6.2f}\t{s.get('v_wind', s['effective_wind']):>+7.2f}\t{s.get('v_air', s['air_speed']):>6.2f}\t"
+                    f"{s['wind_angle']:>6.0f}\t{s['slope']:>6.1f}\t{s['power']:>6.0f}\t{s['cda']:>7.4f}"
+                )
+            else:
+                elev_str = f"{s['start_elevation']:>6.0f}" if s.get('start_elevation') is not None else f"{'N/A':>6}"
+                t.append(
+                    f"{s['segment_id']:<3}\t{s['duration']:>6.0f}\t{s['distance']:>8.0f}\t"
+                    f"{elev_str}\t{s.get('v_ground', s['speed']):>6.2f}\t{s.get('v_wind', s['effective_wind']):>+7.2f}\t{s.get('v_air', s['air_speed']):>6.2f}\t"
+                    f"{s['wind_angle']:>6.0f}\t{s['slope']:>6.1f}\t{s['power']:>6.0f}\t{s['cda']:>7.4f}"
+                )
         t.append("\nSummary:")
         t.append("-" * 100)
 
@@ -1044,6 +1132,7 @@ class GUIInterface(QMainWindow):
 
         if s:
             t.append(f"Total segments analyzed: {s['total_segments']}")
+            t.append(f"GPS coords: {'Yes' if s.get('has_gps_coordinates', False) else 'No'}  |  Elev source: {s.get('elevation_source', 'Unknown')}")
             keep_percent = s.get('keep_percent', self.analyzer.parameters.get('cda_keep_percent', 80.0))
             kept_used = s.get('kept_segments_used', s['total_segments'])
             t.append(f"Weighted CdA (all segments): {s.get('weighted_cda_all', s['weighted_cda']):.4f}")
@@ -1059,7 +1148,6 @@ class GUIInterface(QMainWindow):
             t.append(f"Average air speed      v_a: {s['avg_air_speed']:.2f} m/s")
             t.append(f"Total analysis duration: {s['total_duration']:.0f} seconds")
             t.append(f"Total distance analyzed: {s['total_distance']:.0f} meters")
-            t.append("")
         else:
             t.append("No steady segments found.")
 
@@ -1386,6 +1474,12 @@ class GUIInterface(QMainWindow):
         if not self.analysis_results or not self.preprocessed_segments:
             return None
         
+        # Check if elevation API is enabled but wasn't fetched during file load
+        use_api = self.parameters.get('use_open_elevation_api', False)
+        missing_api_column = bool(self.preprocessed_segments) and ('altitude_api' not in self.preprocessed_segments[0].columns)
+        if use_api and missing_api_column:
+            self._fetch_missing_elevation_data()
+        
         simulation_results = []
         
         # Use the preprocessed segments from the original analysis
@@ -1414,10 +1508,16 @@ class GUIInterface(QMainWindow):
                 self.analyzer.update_parameters({'wind_effect_factor': orig_factor})
             
             if result:
+                start_elev = float(segment_df['altitude'].iloc[0]) if 'altitude' in segment_df.columns and not segment_df['altitude'].isna().all() else None
+                start_elev_fit = float(segment_df['altitude_fit'].iloc[0]) if 'altitude_fit' in segment_df.columns and not segment_df['altitude_fit'].isna().all() else None
+                start_elev_api = float(segment_df['altitude_api'].iloc[0]) if 'altitude_api' in segment_df.columns and not segment_df['altitude_api'].isna().all() else None
                 result.update({
                     'segment_id': i,
                     'start_time': segment_df['timestamp'].iloc[0],
-                    'end_time': segment_df['timestamp'].iloc[-1]
+                    'end_time': segment_df['timestamp'].iloc[-1],
+                    'start_elevation': start_elev,
+                    'start_elevation_fit': start_elev_fit,
+                    'start_elevation_api': start_elev_api,
                 })
                 simulation_results.append(result)
         return simulation_results
@@ -1447,21 +1547,39 @@ class GUIInterface(QMainWindow):
         t.append(f"  Pressure: {pressure:.2f}\n")
 
         # --- Segment Table Header ---
+        use_api = self.parameters.get('use_open_elevation_api', False)
+        has_gps = 'latitude' in self.ride_data.columns if self.ride_data is not None else False
         t.append(f"Segment Results ({len(self.simulation_results)} segments):")
-        t.append("-" * 200)
-        t.append(f"{'ID':<3}\t{'Dur':>6}\t{'Dist':>8}\t{'v_g':>6}\t{'v_w':>7}\t{'v_a':>6}\t"
-                f"{'Angle':>6}\t{'Slope':>6}\t{'Power':>6}\t{'CdA':>7}")
-        t.append(f"{'':3}\t{'(s)':>6}\t{'(m)':>8}\t{'m/s':>6}\t{'m/s':>7}\t{'m/s':>6}\t"
-                f"{'(deg)':>6}\t{'(deg)':>6}\t{'(W)':>6}\t{'':>7}")
+        t.append("-" * 250)
+        if use_api:
+            t.append(f"{'ID':<3}\t{'Dur':>6}\t{'Dist':>8}\t{'Elev FIT':>8}\t{'Elev API':>8}\t{'v_g':>6}\t{'v_w':>7}\t{'v_a':>6}\t"
+                    f"{'Angle':>6}\t{'Slope':>6}\t{'Power':>6}\t{'CdA':>7}")
+            t.append(f"{'':3}\t{'(s)':>6}\t{'(m)':>8}\t{'(m)':>8}\t{'(m)':>8}\t{'m/s':>6}\t{'m/s':>7}\t{'m/s':>6}\t"
+                    f"{'(deg)':>6}\t{'(deg)':>6}\t{'(W)':>6}\t{'':>7}")
+        else:
+            t.append(f"{'ID':<3}\t{'Dur':>6}\t{'Dist':>8}\t{'Elev':>6}\t{'v_g':>6}\t{'v_w':>7}\t{'v_a':>6}\t"
+                    f"{'Angle':>6}\t{'Slope':>6}\t{'Power':>6}\t{'CdA':>7}")
+            t.append(f"{'':3}\t{'(s)':>6}\t{'(m)':>8}\t{'(m)':>6}\t{'m/s':>6}\t{'m/s':>7}\t{'m/s':>6}\t"
+                    f"{'(deg)':>6}\t{'(deg)':>6}\t{'(W)':>6}\t{'':>7}")
         t.append("-" * 200)
 
         # --- Segment Rows ---
         for s in self.simulation_results:
-            t.append(
-                f"{s['segment_id']:<3}\t{s['duration']:>6.0f}\t{s['distance']:>8.0f}\t"
-                f"{s.get('v_ground', s['speed']):>6.2f}\t{s.get('v_wind', s['effective_wind']):>+7.2f}\t{s.get('v_air', s['air_speed']):>6.2f}\t"
-                f"{s['wind_angle']:>6.0f}\t{s['slope']:>6.1f}\t{s['power']:>6.0f}\t{s['cda']:>7.4f}"
-            )
+            if use_api:
+                fit_str = f"{s['start_elevation_fit']:>8.0f}" if s.get('start_elevation_fit') is not None else f"{'N/A':>8}"
+                api_str = f"{s['start_elevation_api']:>8.0f}" if s.get('start_elevation_api') is not None else f"{'N/A':>8}"
+                t.append(
+                    f"{s['segment_id']:<3}\t{s['duration']:>6.0f}\t{s['distance']:>8.0f}\t"
+                    f"{fit_str}\t{api_str}\t{s.get('v_ground', s['speed']):>6.2f}\t{s.get('v_wind', s['effective_wind']):>+7.2f}\t{s.get('v_air', s['air_speed']):>6.2f}\t"
+                    f"{s['wind_angle']:>6.0f}\t{s['slope']:>6.1f}\t{s['power']:>6.0f}\t{s['cda']:>7.4f}"
+                )
+            else:
+                elev_str = f"{s['start_elevation']:>6.0f}" if s.get('start_elevation') is not None else f"{'N/A':>6}"
+                t.append(
+                    f"{s['segment_id']:<3}\t{s['duration']:>6.0f}\t{s['distance']:>8.0f}\t"
+                    f"{elev_str}\t{s.get('v_ground', s['speed']):>6.2f}\t{s.get('v_wind', s['effective_wind']):>+7.2f}\t{s.get('v_air', s['air_speed']):>6.2f}\t"
+                    f"{s['wind_angle']:>6.0f}\t{s['slope']:>6.1f}\t{s['power']:>6.0f}\t{s['cda']:>7.4f}"
+                )
 
         # --- Summary Section ---
         t.append("\nSummary:")
@@ -1475,6 +1593,7 @@ class GUIInterface(QMainWindow):
             weighted_kept = weighted_metrics['weighted_cda_kept']
             keep_percent = weighted_metrics['keep_percent']
             kept_used = weighted_metrics['kept_segments_used']
+            t.append(f"GPS coords: {'Yes' if hasattr(self.ride_data, 'latitude') and 'latitude' in self.ride_data.columns else 'No'}  |  Elev source: {self.analyzer.elevation_source if self.analyzer.elevation_source else 'Unknown'}")
             t.append(f"Weighted CdA (all segments): {weighted_all:.4f}")
             t.append(f"Weighted CdA ({keep_percent:.0f}%): {weighted_kept:.4f} [{kept_used} segments]")
             t.append(f"Average CdA: {np.mean(cda_values):.4f}")
@@ -1483,6 +1602,49 @@ class GUIInterface(QMainWindow):
             t.append(f"Max CdA: {np.max(cda_values):.4f}")
 
 
+    def _fetch_missing_elevation_data(self):
+        """Fetch missing elevation data from Open-Elevation API after file load"""
+        from elevation import ElevationService
+        import numpy as np
+        
+        _logger.info("Fetching missing elevation API data for segments...")
+        
+        try:
+            # Collect all unique GPS coordinates from all segments
+            all_coords = []
+            for segment_df in self.preprocessed_segments:
+                if 'latitude' in segment_df.columns and 'longitude' in segment_df.columns:
+                    coords = segment_df[['latitude', 'longitude']].dropna()
+                    all_coords.extend(zip(coords['latitude'], coords['longitude']))
+            
+            if not all_coords:
+                _logger.warning("No GPS coordinates available for elevation lookup")
+                return
+            
+            # Deduplicate and fetch elevations
+            unique_coords = list(dict.fromkeys(all_coords))
+            elevation_service = ElevationService()
+            elevation_map = elevation_service.get_elevations_batch(unique_coords)
+            
+            if not elevation_map:
+                _logger.warning("Failed to fetch elevation data from API")
+                return
+            
+            # Add altitude_api column to each segment
+            for segment_df in self.preprocessed_segments:
+                if 'latitude' in segment_df.columns and 'longitude' in segment_df.columns:
+                    def get_elevation(row):
+                        key = (row['latitude'], row['longitude'])
+                        fit_alt = row.get('altitude_fit', row.get('altitude', np.nan))
+                        return elevation_map.get(key, fit_alt)
+                    
+                    segment_df['altitude_api'] = segment_df.apply(get_elevation, axis=1)
+            
+            self.analyzer.elevation_source = 'Open-Elevation API (fetched during simulation)'
+            _logger.info(f"Successfully fetched {len(elevation_map)} elevations from Open-Elevation API")
+        except Exception as e:
+            _logger.warning(f"Error fetching elevation data: {e}")
+    
     def _generate_simulation_plots(self):
         """Generate plots for simulation results"""
         if not self.simulation_results or self.ride_data is None:
@@ -1662,45 +1824,67 @@ class GUIInterface(QMainWindow):
         """Handle wind effect slider release - re-run analysis with new factor"""
         if not self.analysis_results or self.ride_data is None or not self.preprocessed_segments:
             return
-        
-        # Store the old ride_info before we overwrite analysis_results
-        old_ride_info = self.analysis_results.get('summary', {}).get('ride_info')
-        
-        # Get the new wind effect factor from slider
-        new_factor = self.wind_effect_slider.value() / 100.0
-        
-        # Update analyzer parameter
-        self.analyzer.update_parameters({'wind_effect_factor': new_factor})
-        
-        # Re-analyze with preprocessed segments
-        self.analysis_status.setText("Re-analyzing with new wind effect factor...")
-        self.progress.setRange(0, 0) 
-        
-        # Use the same segments from original analysis
-        segment_results = self.analyzer._analyze_segments(self.preprocessed_segments)
-        summary = self.analyzer._calculate_summary(segment_results)
-        
-        # RE-INSERT the ride_info back into the new summary
-        if old_ride_info:
-            summary['ride_info'] = old_ride_info
-        
-        # Update results
-        self.analysis_results = {
-            'segments': segment_results,
-            'summary': summary,
-            'parameters': self.analyzer.parameters
-        }
-        
-        # Display updated results
-        self.progress.setRange(0, 100)
-        self.progress.setValue(100)
-        self.analysis_status.setText("Re-analysis complete!")
-        self.summary_text.clear()
-        self._display_analysis_results()
-        
-        # Refresh map and plots
-        self._generate_map()
-        self._generate_plots()
+
+        try:
+            # Store the old ride_info before we overwrite analysis_results
+            old_ride_info = self.analysis_results.get('summary', {}).get('ride_info')
+
+            # Get the new wind effect factor from slider
+            new_factor = self.wind_effect_slider.value() / 100.0
+
+            # Update analyzer parameter
+            self.analyzer.update_parameters({'wind_effect_factor': new_factor})
+
+            # Re-analyze with progress checkpoints so the bar visibly updates.
+            self.progress.setRange(0, 100)
+            self.progress.setValue(5)
+            self.analysis_status.setText("Re-analyzing with new wind effect factor...")
+            QApplication.processEvents()
+
+            # Use the same segments from original analysis
+            segment_results = self.analyzer._analyze_segments(self.preprocessed_segments)
+            self.progress.setValue(55)
+            self.analysis_status.setText("Re-analysis: calculating summary...")
+            QApplication.processEvents()
+
+            summary = self.analyzer._calculate_summary(segment_results)
+
+            # RE-INSERT the ride_info back into the new summary
+            if old_ride_info:
+                summary['ride_info'] = old_ride_info
+
+            # Update results
+            self.analysis_results = {
+                'segments': segment_results,
+                'summary': summary,
+                'parameters': self.analyzer.parameters
+            }
+
+            self.progress.setValue(70)
+            self.analysis_status.setText("Re-analysis: updating summary...")
+            QApplication.processEvents()
+
+            # Display updated results
+            self.summary_text.clear()
+            self._display_analysis_results()
+
+            self.progress.setValue(82)
+            self.analysis_status.setText("Re-analysis: refreshing map...")
+            QApplication.processEvents()
+            self._generate_map()
+
+            self.progress.setValue(92)
+            self.analysis_status.setText("Re-analysis: refreshing plots...")
+            QApplication.processEvents()
+            self._generate_plots()
+
+            self.progress.setValue(100)
+            self.analysis_status.setText("Re-analysis complete!")
+        except Exception as e:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
+            self.analysis_status.setText("Re-analysis failed")
+            QMessageBox.critical(self, "Error", f"Wind effect re-analysis failed: {str(e)}")
 
     def _set_window_icon(self):
         """Set window icon from logo.PNG"""

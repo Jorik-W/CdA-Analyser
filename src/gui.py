@@ -265,9 +265,11 @@ class GUIInterface:
             self.root.update()
             
             fit_parser = FITParser()
-            self.ride_data = fit_parser.parse_fit_file(self.fit_file_path)
+            use_elev_api = self.parameters.get('use_open_elevation_api', False)
+            self.ride_data = fit_parser.parse_fit_file(self.fit_file_path, use_elev_api)
             
             self.file_status.insert(tk.END, f"Successfully loaded {len(self.ride_data)} data points\n")
+            self.file_status.insert(tk.END, f"Elevation source: {fit_parser.elevation_source}\n")
             self.file_status.insert(tk.END, f"Columns: {', '.join(self.ride_data.columns[:10])}\n")
             
             if len(self.ride_data.columns) > 10:
@@ -275,6 +277,7 @@ class GUIInterface:
             
             self.parameters = DEFAULT_PARAMETERS.copy()
             self.analyzer = CDAAnalyzer(self.parameters)
+            self.analyzer.elevation_source = fit_parser.elevation_source
             self.weather_service = WeatherService()
             self._enable_segment_parameters()
             
@@ -449,6 +452,7 @@ class GUIInterface:
         summary = results['summary']
         if summary:
             text.insert(tk.END, f"Total segments analyzed: {summary['total_segments']}\n")
+            text.insert(tk.END, f"GPS coords: {'Yes' if summary.get('has_gps_coordinates', False) else 'No'}  |  Elev source: {summary.get('elevation_source', 'Unknown')}\n")
             text.insert(tk.END, f"Weighted CdA: {summary['weighted_cda']:.4f}\n")
             text.insert(tk.END, f"Average CdA: {summary['average_cda']:.4f}\n")
             text.insert(tk.END, f"CdA standard deviation: {summary['cda_std']:.4f}\n")
