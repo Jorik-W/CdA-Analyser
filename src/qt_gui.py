@@ -4,8 +4,11 @@
 import sys
 import os
 import json
+import logging
 from pathlib import Path
 import traceback
+
+_logger = logging.getLogger(__name__)
 
 # Third-party imports
 import pandas as pd
@@ -143,7 +146,7 @@ def resource_path(relative_path):
         if os.path.exists(alt_path):
             path = alt_path
         else:
-            print(f"[WARNING] Resource not found: {path}")
+            _logger.warning("Resource not found: %s", path)
     return path
 
 class GUIInterface(QMainWindow):
@@ -789,11 +792,15 @@ class GUIInterface(QMainWindow):
         s = r['summary']
 
         if s:
+            avg_temp = s.get('avg_temp')
+            avg_press = s.get('avg_press')
+            avg_wind  = s.get('avg_wind_speed')
+            avg_dir   = s.get('avg_wind_direction')
             t.append("Weather Conditions:")
-            t.append(f"  Average temperature: {s['avg_temp']:.1f} C")
-            t.append(f"  Average pressure: {s['avg_press']:.2f} hPa")
-            t.append(f"  Average wind speed: {s['avg_wind_speed']:.1f} m/s")
-            t.append(f"  Average wind direction: {s['avg_wind_direction']:.2f} °")
+            t.append(f"  Average temperature: {avg_temp:.1f} °C" if avg_temp is not None and not (isinstance(avg_temp, float) and avg_temp != avg_temp) else "  Average temperature: N/A")
+            t.append(f"  Average pressure: {avg_press:.2f} hPa" if avg_press is not None and not (isinstance(avg_press, float) and avg_press != avg_press) else "  Average pressure: N/A")
+            t.append(f"  Average wind speed: {avg_wind:.1f} m/s" if avg_wind is not None else "  Average wind speed: N/A")
+            t.append(f"  Average wind direction: {avg_dir:.2f} °" if avg_dir is not None and not (isinstance(avg_dir, float) and avg_dir != avg_dir) else "  Average wind direction: N/A")
 
         t.append(f"Segment Analysis ({len(r['segments'])} steady segments found):")
         t.append("-" * 200)
@@ -1013,13 +1020,15 @@ class GUIInterface(QMainWindow):
                     wind_angles[i] += 360
             sc = ax6.scatter(wind_angles, cda_vals, c=air_speeds, cmap='viridis', s=100,
                              alpha=0.8, edgecolors='k', linewidth=0.5)
-            coeffs = np.polyfit(wind_angles, cda_vals, 2)
-            poly = np.poly1d(coeffs)
-            x_fit = np.linspace(-180, 180, 300)
-            ax6.plot(x_fit, poly(x_fit), color='red', lw=1.0)
-            formula = f"y = {coeffs[0]:.3e}x² + {coeffs[1]:.3e}x + {coeffs[2]:.3e}"
-            ax6.text(0.95, 0.05, formula, transform=ax6.transAxes, fontsize=7, color='red',
-                     ha='right', va='bottom', bbox=dict(facecolor='white', alpha=0.6))
+            # Only attempt polyfit when there are enough distinct angle values
+            if len(set(wind_angles)) > 2:
+                coeffs = np.polyfit(wind_angles, cda_vals, 2)
+                poly = np.poly1d(coeffs)
+                x_fit = np.linspace(-180, 180, 300)
+                ax6.plot(x_fit, poly(x_fit), color='red', lw=1.0)
+                formula = f"y = {coeffs[0]:.3e}x\u00b2 + {coeffs[1]:.3e}x + {coeffs[2]:.3e}"
+                ax6.text(0.95, 0.05, formula, transform=ax6.transAxes, fontsize=7, color='red',
+                         ha='right', va='bottom', bbox=dict(facecolor='white', alpha=0.6))
             ax6.set_title('CdA vs Air Angle', fontsize=10, fontweight='bold')
             ax6.set_xlabel('Air Angle (°)', fontsize=8)
             ax6.set_ylabel('CdA', fontsize=8)
@@ -1173,13 +1182,13 @@ class GUIInterface(QMainWindow):
             
             # Update analyzer with simulation wind factor
             orig_factor = self.analyzer.parameters['wind_effect_factor']
-            self.analyzer.update_parameters({'wind_effect_factor': wind_factor})
-            
-            # Calculate CdA with simulated wind
-            result = self.analyzer.calculate_cda_for_segment(segment_df, weather_data)
-            
-            # Restore original factor
-            self.analyzer.update_parameters({'wind_effect_factor': orig_factor})
+            try:
+                self.analyzer.update_parameters({'wind_effect_factor': wind_factor})
+                # Calculate CdA with simulated wind
+                result = self.analyzer.calculate_cda_for_segment(segment_df, weather_data)
+            finally:
+                # Always restore the original factor, even if an exception is raised
+                self.analyzer.update_parameters({'wind_effect_factor': orig_factor})
             
             if result:
                 result.update({
@@ -1246,7 +1255,7 @@ class GUIInterface(QMainWindow):
     def _generate_simulation_plots(self):
         """Generate plots for simulation results"""
         if not self.simulation_results or self.ride_data is None:
-            print("No simulation results or ride data to plot.")
+            _logger.warning("No simulation results or ride data to plot.")
             return
         
         try:
@@ -1350,13 +1359,14 @@ class GUIInterface(QMainWindow):
 
             sc = ax6.scatter(wind_angles, cda_vals, c=air_speeds, cmap='viridis', s=100,
                              alpha=0.8, edgecolors='k', linewidth=0.5)
-            coeffs = np.polyfit(wind_angles, cda_vals, 2)
-            poly = np.poly1d(coeffs)
-            x_fit = np.linspace(-180, 180, 300)
-            ax6.plot(x_fit, poly(x_fit), color='red', lw=1.0)
-            formula = f"y = {coeffs[0]:.3e}x² + {coeffs[1]:.3e}x + {coeffs[2]:.3e}"
-            ax6.text(0.95, 0.05, formula, transform=ax6.transAxes, fontsize=7, color='red',
-                     ha='right', va='bottom', bbox=dict(facecolor='white', alpha=0.6))
+            if len(set(wind_angles)) > 2:
+                coeffs = np.polyfit(wind_angles, cda_vals, 2)
+                poly = np.poly1d(coeffs)
+                x_fit = np.linspace(-180, 180, 300)
+                ax6.plot(x_fit, poly(x_fit), color='red', lw=1.0)
+                formula = f"y = {coeffs[0]:.3e}x\u00b2 + {coeffs[1]:.3e}x + {coeffs[2]:.3e}"
+                ax6.text(0.95, 0.05, formula, transform=ax6.transAxes, fontsize=7, color='red',
+                         ha='right', va='bottom', bbox=dict(facecolor='white', alpha=0.6))
             ax6.set_title('CdA vs Air Angle', fontsize=10, fontweight='bold')
             ax6.set_xlabel('Air Angle (°)', fontsize=8)
             ax6.set_ylabel('CdA', fontsize=8)
@@ -1473,7 +1483,7 @@ class GUIInterface(QMainWindow):
             logo_path = resource_path("icons/logo.PNG")
             self.setWindowIcon(QIcon(str(logo_path)))
         except Exception as e:
-            print(f"Could not set icon: {e}")
+            _logger.warning("Could not set icon: %s", e)
 
 def create_splash(app, logo_path, text):
     """Create a splash screen with a box around the logo and text below it."""

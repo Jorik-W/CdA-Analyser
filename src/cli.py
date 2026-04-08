@@ -48,7 +48,8 @@ def main():
             results = analyzer.analyze_ride(df, weather_service)
         except Exception as e:
             print(f"Error during analysis: {e}")
-            sys.exit(1)
+            print("Please adjust parameters and try again.")
+            continue
         
         # Display results
         _display_results(results)

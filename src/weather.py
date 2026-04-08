@@ -9,6 +9,7 @@ from config import OPEN_METEO_URL_FORCAST, OPEN_METEO_URL_ARCIVE
 class WeatherService:
     def __init__(self):
         self.logger = logging.getLogger(__name__)
+        self.session = requests.Session()  # Reuse TCP connection across API calls
     
     def get_weather_data(self, latitude, longitude, timestamp):
         """
@@ -43,12 +44,13 @@ class WeatherService:
                     'wind_direction_10m',
                     'pressure_msl'
                 ]),
+                'wind_speed_unit': 'ms',
                 'start_date': date_str,
                 'end_date': date_str,
                 'timezone': 'UTC'
             }
             
-            response = requests.get(OPEN_METEO_URL, params=params)
+            response = self.session.get(OPEN_METEO_URL, params=params, timeout=10)
             response.raise_for_status()
             
             data = response.json()
@@ -94,16 +96,16 @@ class WeatherService:
             float: Air density in kg/m³
         """
         if temperature is None:
+            self.logger.warning("temperature was None in calculate_air_density, defaulting to 20.0°C")
             temperature = 20.0
-            print("temperature fix")
-        
+
         if pressure is None:
+            self.logger.warning("pressure was None in calculate_air_density, defaulting to 1013.25 hPa")
             pressure = 1013.25
-            print("pressure fix")
-        
+
         if humidity is None:
+            self.logger.warning("humidity was None in calculate_air_density, defaulting to 50%")
             humidity = 50
-            print("humidity fix")
         
         # Convert to Kelvin
         temp_kelvin = temperature + 273.15

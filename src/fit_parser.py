@@ -3,7 +3,6 @@
 import numpy as np
 import pandas as pd
 from fitparse import FitFile
-from geopy.distance import geodesic
 import logging
 
 class FITParser:
@@ -72,23 +71,36 @@ class FITParser:
         if 'distance' not in df.columns:
             df['distance'] = self._calculate_distance(df)
         
-        # Handle missing values
-        df = df.ffill().bfill()
+        # Handle missing values only for non-critical channels.
+        # Keep power/speed gaps explicit so dropout periods are not smeared.
+        safe_fill_columns = [
+            col for col in ['altitude', 'heart_rate', 'cadence', 'distance', 'temperature']
+            if col in df.columns
+        ]
+        if safe_fill_columns:
+            df[safe_fill_columns] = df[safe_fill_columns].ffill().bfill()
         
         return df
     
     def _calculate_distance(self, df):
-        """Calculate cumulative distance from GPS coordinates"""
-        distances = [0.0]
-        total_distance = 0.0
-        
-        for i in range(1, len(df)):
-            if pd.notna(df.iloc[i]['latitude']) and pd.notna(df.iloc[i]['longitude']):
-                if pd.notna(df.iloc[i-1]['latitude']) and pd.notna(df.iloc[i-1]['longitude']):
-                    coord1 = (df.iloc[i-1]['latitude'], df.iloc[i-1]['longitude'])
-                    coord2 = (df.iloc[i]['latitude'], df.iloc[i]['longitude'])
-                    segment_distance = geodesic(coord1, coord2).meters
-                    total_distance += segment_distance
-            distances.append(total_distance)
-        
-        return distances
+        """Calculate cumulative distance from GPS coordinates using vectorized haversine formula"""
+        if 'latitude' not in df.columns or 'longitude' not in df.columns:
+            self.logger.warning("No GPS coordinates available for distance calculation")
+            return [0.0] * len(df)
+
+        lat = np.radians(df['latitude'].values.astype(float))
+        lon = np.radians(df['longitude'].values.astype(float))
+
+        dlat = np.diff(lat)
+        dlon = np.diff(lon)
+
+        # Haversine formula
+        a = np.sin(dlat / 2.0) ** 2 + np.cos(lat[:-1]) * np.cos(lat[1:]) * np.sin(dlon / 2.0) ** 2
+        a = np.clip(a, 0.0, 1.0)  # Numerical safety clamp
+        segment_distances = 6371000.0 * 2.0 * np.arcsin(np.sqrt(a))  # Earth radius in meters
+
+        # Zero out segments where either endpoint has NaN coordinates
+        valid = np.isfinite(lat[:-1]) & np.isfinite(lon[:-1]) & np.isfinite(lat[1:]) & np.isfinite(lon[1:])
+        segment_distances = np.where(valid, segment_distances, 0.0)
+
+        return np.concatenate([[0.0], np.cumsum(segment_distances)]).tolist()

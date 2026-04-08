@@ -2,20 +2,25 @@
 
 # Default parameters
 DEFAULT_PARAMETERS = {
-    'min_segment_length': 200,  # meters
-    'max_slope_variation': 0.50,  # degrees
+    'min_segment_length': 50,  # meters
+    'min_duration': 15,   # seconds
+    'subsegment_min_duration_s': 5.0,   # seconds per sub-segment
+    'subsegment_min_points':     5,     # minimum data-points per sub-segment
+    'max_slope_variation': 1.00,  # degrees
     'min_speed': 8.3,     # m/s
     'max_speed': 20.0,    # m/s
-    'min_duration': 30,   # seconds
     'speed_steady_threshold': .35,    # m/s
-    'power_steady_threshold': 500.0,   # watts
+    'power_steady_threshold': 150.0,   # watts
     'slope_steady_threshold': 5.0,    # degrees
-
     'rider_mass': 75.0,  # kg
     'bike_mass': 10.0,   # kg
     'rolling_resistance': 0.003,
     'drivetrain_loss': 0.025,
     'wind_effect_factor' : 0.06, # (0.0 - 1.0)  look at cli angle +- 0 and angle 180 must be 0 -> +-0.20 cda diff +  CdA standard deviation < 0.05
+
+    # Sub-segment splitting: each steady segment is divided into chunks so that
+    # local GPS bearing, slope and acceleration are computed per chunk rather
+    # than over the full segment length.  Weather data is still fetched once.
 }
 
 # Weather API settings

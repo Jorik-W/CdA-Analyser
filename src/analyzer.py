@@ -5,6 +5,7 @@ import pandas as pd
 import logging
 import math
 from config import DEFAULT_PARAMETERS
+from segment_splitter import split_into_subsegments
 
 class CDAAnalyzer:
     """Analyzes cycling data to calculate coefficient of drag and frontal area (CdA)"""
@@ -40,7 +41,7 @@ class CDAAnalyzer:
         summary = self._calculate_summary(segment_results)
 
         ride_info = self._extract_ride_info(df)
-        if summary is not None and ride_info is not None:
+        if summary and ride_info is not None:  # empty dict is falsy — avoids KeyError in GUI
             summary['ride_info'] = ride_info
         
         self.logger.info(f"Analysis complete: {len(segment_results)} segments analyzed")
@@ -88,35 +89,147 @@ class CDAAnalyzer:
         return segments
     
     def calculate_cda_for_segment(self, segment_df, weather_data=None):
-        """Calculate CdA for a steady segment using rolling averages"""
+        """Calculate CdA for a steady segment using hidden sub-segments.
+
+        Weather data (temperature, pressure, wind speed, wind direction from the
+        API) is shared across all sub-segments — it is fetched once per segment
+        in ``preprocess_ride_data``.
+
+        Each sub-segment uses its own GPS bearing to derive the *local* relative
+        wind angle and its own slope / acceleration averages.  Sub-segment CdA
+        values are aggregated (duration-weighted) to produce the segment result.
+        """
         self.logger.debug(f"Calculating CdA for segment with {len(segment_df)} points")
-        
-        # Prepare rolling averaged data
-        averaged_data = self._prepare_averaged_data(segment_df)
+
+        # Environmental conditions are shared for the whole segment
+        env_conditions = self._get_environmental_conditions(weather_data)
+
+        # Split into sub-segments for local accuracy
+        subsegments = split_into_subsegments(
+            segment_df,
+            min_duration_s=self.parameters.get('subsegment_min_duration_s', 20.0),
+            min_points=int(self.parameters.get('subsegment_min_points', 10)),
+        )
+
+        sub_results = []
+        for sub_df in subsegments:
+            sub_result = self._calculate_cda_for_subsegment(sub_df, env_conditions)
+            if sub_result is not None:
+                sub_results.append(sub_result)
+
+        if not sub_results:
+            self.logger.warning("No valid CdA values calculated for any sub-segment")
+            return None
+
+        return self._aggregate_subsegment_results(segment_df, sub_results, env_conditions)
+
+    # ------------------------------------------------------------------
+    # Sub-segment helpers
+    # ------------------------------------------------------------------
+
+    def _calculate_cda_for_subsegment(self, sub_df, env_conditions):
+        """Calculate CdA for one sub-segment.
+
+        Uses sub_df for its own GPS bearing (local relative wind angle) and
+        its own slope / acceleration averages.  env_conditions carries the
+        parent segment's air density and API wind values.
+        """
+        averaged_data = self._prepare_averaged_data(sub_df)
         if averaged_data is None:
             return None
-        
-        # Get environmental conditions
-        env_conditions = self._get_environmental_conditions(weather_data)
-        
-        # Calculate power components
+
+        # Power components — segment_df is sub_df → local bearing
         power_components = self._calculate_power_components(
-            averaged_data, env_conditions, segment_df
+            averaged_data, env_conditions, sub_df
         )
-        
-        # Calculate CdA values
+
         cda_values = self._calculate_cda_values(
             averaged_data, power_components, env_conditions
         )
-        
         if not cda_values:
-            self.logger.warning("No valid CdA values calculated for segment")
             return None
-        
-        # Calculate final result
-        return self._compile_segment_result(
-            segment_df, averaged_data, cda_values, power_components, env_conditions
+
+        filtered_cda = self._filter_cda_outliers(cda_values)
+        if not filtered_cda:
+            return None
+
+        averages = self._calculate_segment_averages(averaged_data, power_components)
+        cda_mean = float(np.mean(filtered_cda))
+        cda_std  = float(np.std(filtered_cda)) if len(filtered_cda) > 1 else 0.0
+
+        return {
+            'cda':        cda_mean,
+            'cda_std':    cda_std,
+            'cda_points': len(filtered_cda),
+            'duration':   self._get_segment_duration(sub_df),
+            'distance':   self._get_segment_distance(sub_df),
+            **averages,
+            **power_components['wind_effects'],
+        }
+
+    def _aggregate_subsegment_results(self, segment_df, sub_results, env_conditions):
+        """Aggregate per-sub-segment results into a single segment result dict.
+
+        All scalar fields are computed as duration-weighted averages.
+        Wind angle uses a circular weighted mean so that cross-winds near
+        ±180° are handled correctly.
+        """
+        durations   = [r['duration'] for r in sub_results]
+        total_dur   = sum(durations)
+        weights     = [d / total_dur for d in durations]
+
+        def wavg(key):
+            return float(sum(r[key] * w for r, w in zip(sub_results, weights)))
+
+        # Duration-weighted CdA
+        cda_values  = np.array([r['cda'] for r in sub_results])
+        final_cda   = float(np.average(cda_values, weights=weights))
+        # Weighted population std-dev across sub-segment means
+        cda_std     = float(np.sqrt(
+            np.average((cda_values - final_cda) ** 2, weights=weights)
+        ))
+        total_pts   = sum(r['cda_points'] for r in sub_results)
+
+        # Circular weighted mean for wind angle
+        angles_rad  = np.radians([r['wind_angle'] for r in sub_results])
+        avg_wind_angle = float(np.degrees(np.arctan2(
+            np.average(np.sin(angles_rad), weights=weights),
+            np.average(np.cos(angles_rad), weights=weights),
+        )))
+
+        averages = {
+            'speed':          wavg('speed'),
+            'power':          wavg('power'),
+            'effective_power': wavg('effective_power'),
+            'acceleration':   wavg('acceleration'),
+            'slope':          wavg('slope'),
+            'aero_power':     wavg('aero_power'),
+            'rolling_power':  wavg('rolling_power'),
+            'gradient_power': wavg('gradient_power'),
+            'inertial_power': wavg('inertial_power'),
+        }
+
+        residual = self._calculate_residual(
+            averages,
+            final_cda,
+            env_conditions,
+            {'air_speed': wavg('air_speed')},
         )
+
+        return {
+            'cda':          final_cda,
+            'cda_std':      cda_std,
+            'cda_points':   total_pts,
+            'residual':     residual,
+            'duration':     self._get_segment_duration(segment_df),
+            'distance':     self._get_segment_distance(segment_df),
+            'air_density':  env_conditions['air_density'],
+            'effective_wind': wavg('effective_wind'),
+            'air_speed':    wavg('air_speed'),
+            'wind_angle':   avg_wind_angle,
+            'subsegments':  sub_results,   # hidden detail; available for debugging
+            **averages,
+        }
     
     # ============ Data Preparation Methods ============
 
@@ -198,7 +311,8 @@ class CDAAnalyzer:
                 speed_diff / time_diff,
                 0
             )
-            df['acceleration'] = pd.Series(acceleration).fillna(0)
+            # Use df.index so assignment aligns correctly when df is a non-default-indexed slice
+            df['acceleration'] = pd.Series(acceleration, index=df.index).fillna(0)
             self.logger.debug(f"Calculated acceleration for {len(df)} points")
         
         return df
@@ -210,7 +324,11 @@ class CDAAnalyzer:
         # Extract base data
         speeds = segment_df['speed']
         powers = segment_df.get('power')
-        accelerations = segment_df.get('acceleration', pd.Series([0] * len(segment_df)))
+        # Provide index-aligned fallback so rolling averages and masks work correctly
+        accelerations = segment_df.get(
+            'acceleration',
+            pd.Series([0] * len(segment_df), index=segment_df.index)
+        )
         
         if powers is None:
             self.logger.warning("No power data available for segment")
@@ -392,14 +510,19 @@ class CDAAnalyzer:
         
         return conditions
     
-    def _calculate_air_density(self, weather_data):
-        """Calculate air density from weather data"""
-        from weather import WeatherService
-        weather_service = WeatherService()
-        return weather_service.calculate_air_density(
-            weather_data['temperature'], 
-            weather_data['pressure']
-        )
+    @staticmethod
+    def _calculate_air_density(weather_data):
+        """Calculate air density from weather data using ideal gas law.
+        Avoids instantiating WeatherService (and a new HTTP session) on every segment.
+        """
+        temp = weather_data.get('temperature', 20.0)
+        pressure = weather_data.get('pressure', 1013.25)
+        if temp is None:
+            temp = 20.0
+        if pressure is None:
+            pressure = 1013.25
+        temp_kelvin = temp + 273.15
+        return (pressure * 100.0) / (287.05 * temp_kelvin)
     
     # ============ Power and Force Calculation Methods ============
     
@@ -495,12 +618,15 @@ class CDAAnalyzer:
 
             if bike_speed is None:
                 bike_speed = 0.0
-
-            if effective_wind is None:
+            if not isinstance(effective_wind, (int, float)) or not math.isfinite(effective_wind):
+                self.logger.debug("effective_wind invalid, defaulting to 0")
                 effective_wind = 0.0
 
             air_speed = bike_speed + effective_wind
-            
+            if air_speed < 0.1:
+                self.logger.debug(f"air_speed {air_speed:.2f} m/s below minimum (strong tailwind?), clamping to 0.1")
+                air_speed = 0.1
+
             self.logger.debug(f"Wind: rider={segment_direction:.1f}°, wind={wind_direction:.1f}°, "
                             f"angle={wind_angle_deg:.1f}°, effective={effective_wind:.2f}m/s")
             
@@ -557,10 +683,7 @@ class CDAAnalyzer:
         if bike_speed is None:
             bike_speed = 0.0
 
-        if effective_wind is None:
-            effective_wind = 0.0
-
-        air_speed = bike_speed + effective_wind
+        air_speed = max(bike_speed + effective_wind, 0.1)
         self.logger.debug("Using fallback wind calculation")
         
         return {
@@ -623,34 +746,10 @@ class CDAAnalyzer:
             env_conditions['wind_direction'], speeds.mean()
         )
 
-        if speeds is None:
-            speeds = 0.0
-            print("speeds fix")
-
-        if wind_effects['effective_wind'] is None:
-            wind_effects['effective_wind'] = 0.0
-            print("wind array fix")
-
         air_speed = speeds + wind_effects['effective_wind']
 
         # Calculate aerodynamic force using the fixed CdA
         aero_force = 0.5 * env_conditions['air_density'] * fixed_cda * air_speed**2
-
-        if rolling_force is None:
-            rolling_force = 0.0
-            print("rolling fix")
-
-        if gradient_force is None:
-            gradient_force = 0.0
-            print("gradient fix")
-
-        if inertial_force is None:
-            inertial_force = 0.0
-            print("inertial fix")
-
-        if aero_force is None:
-            aero_force = 0.0
-            print("aero fix")
 
         # Total force
         total_force = rolling_force + gradient_force + inertial_force + aero_force
@@ -663,14 +762,12 @@ class CDAAnalyzer:
 
     def _calculate_single_cda(self, speed, aero_power, effective_wind, air_density):
         """Calculate CdA for a single data point"""
-
         if speed is None:
+            self.logger.debug("speed was None in _calculate_single_cda, defaulting to 0")
             speed = 0.0
-            print("speed fix")
-
         if effective_wind is None:
+            self.logger.debug("effective_wind was None in _calculate_single_cda, defaulting to 0")
             effective_wind = 0.0
-            print("effective wind fix")   
 
         air_speed = speed + effective_wind
         
@@ -750,19 +847,6 @@ class CDAAnalyzer:
     
     def _calculate_residual(self, averages, cda, env_conditions, wind_effects):
         """Calculate power residual for quality assessment"""
-
-        if averages['rolling_power'] is None:
-            averages['rolling_power'] = 0.0
-            print("average rolling fix")
-
-        if averages['gradient_power'] is None:
-            averages['gradient_power'] = 0.0
-            print("average gradient fix")
-
-        if averages['inertial_power'] is None:
-            averages['inertial_power'] = 0.0
-            print("average inertial fix")  
-
         calculated_power = (
             averages['rolling_power'] + 
             averages['gradient_power'] + 
@@ -938,6 +1022,11 @@ class CDAAnalyzer:
         else:
             avg_wind_direction = np.nan
 
+        # Pre-compute optional per-segment values in a single pass to avoid multiple iterations
+        wind_speeds = [s['wind_speed'] for s in segment_results if 'wind_speed' in s]
+        temperatures = [s['temperature'] for s in segment_results if 'temperature' in s]
+        pressures = [s['pressure'] for s in segment_results if 'pressure' in s]
+
         summary = {
             'total_segments': len(segment_results),
             'weighted_cda': weighted_cda,
@@ -948,12 +1037,11 @@ class CDAAnalyzer:
             'max_cda': np.max(cda_values),
             'total_duration': sum(s['duration'] for s in segment_results),
             'total_distance': sum(s['distance'] for s in segment_results),
-            'avg_wind_speed': np.mean([s.get('wind_speed', 0) for s in segment_results]),
+            'avg_wind_speed': float(np.mean(wind_speeds)) if wind_speeds else 0.0,
             'avg_air_speed': np.mean([s.get('air_speed', 0) for s in segment_results]),
             'avg_acceleration': np.mean([s['acceleration'] for s in segment_results]),
-            'avg_temp': np.mean([s['temperature'] for s in segment_results if 'temperature' in s]),
-            'avg_press': np.mean(   [s['pressure'] for s in segment_results if 'pressure' in s]),
-            'avg_wind_speed': np.mean([s['wind_speed'] for s in segment_results if 'wind_speed' in s]),
+            'avg_temp': float(np.mean(temperatures)) if temperatures else float('nan'),
+            'avg_press': float(np.mean(pressures)) if pressures else float('nan'),
             'avg_wind_direction': avg_wind_direction
         }
         
