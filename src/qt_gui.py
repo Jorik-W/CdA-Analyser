@@ -1430,12 +1430,20 @@ class GUIInterface(QMainWindow):
             mask_20 = [abs(y) <= 20 for y in yaw_vals]
             yv20 = [yaw_vals[i] for i in range(len(yaw_vals)) if mask_20[i]]
             cv20 = [cda_vals[i] for i in range(len(cda_vals)) if mask_20[i]]
-            if len(set([round(y, 1) for y in yv20])) >= 5:
-                co = np.polyfit(yv20, cv20, 4)
-                x_fit = np.linspace(-20, 20, 200)
-                ax5.plot(x_fit, np.poly1d(co)(x_fit), color='red', lw=1.5)
-                ax5.text(0.95, 0.05, f"y={co[0]:.3e}x^4+{co[1]:.3e}x^3+{co[2]:.3e}x^2+{co[3]:.3e}x+{co[4]:.3e}", transform=ax5.transAxes,
-                         fontsize=7, color='red', ha='right', va='bottom', bbox=dict(facecolor='white', alpha=0.6))
+            _yv = np.array(yv20, dtype=float)
+            _cv_yaw = np.array(cv20, dtype=float)
+            _valid_yaw = np.isfinite(_yv) & np.isfinite(_cv_yaw)
+            _yv, _cv_yaw = _yv[_valid_yaw], _cv_yaw[_valid_yaw]
+            if len(set(round(float(y), 1) for y in _yv)) >= 5 and np.ptp(_yv) > 0:
+                try:
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        co = np.polyfit(_yv, _cv_yaw, 4)
+                    x_fit = np.linspace(-20, 20, 200)
+                    ax5.plot(x_fit, np.poly1d(co)(x_fit), color='red', lw=1.5)
+                    ax5.text(0.95, 0.05, f"y={co[0]:.3e}x^4+{co[1]:.3e}x^3+{co[2]:.3e}x^2+{co[3]:.3e}x+{co[4]:.3e}", transform=ax5.transAxes,
+                             fontsize=7, color='red', ha='right', va='bottom', bbox=dict(facecolor='white', alpha=0.6))
+                except Exception:
+                    pass
             for i, sid in enumerate(seg_ids):
                 ax5.annotate(str(sid), (yaw_vals[i], cda_vals[i]), xytext=(5, 5), textcoords='offset points', fontsize=6, alpha=0.8)
             ax5.set_title('CdA vs Yaw Angle', fontsize=10, fontweight='bold')
@@ -1449,12 +1457,20 @@ class GUIInterface(QMainWindow):
             # --- 6. CdA vs Wind Angle ---
             ax6 = self.current_figure.add_subplot(gs[2, 1])
             sc6 = ax6.scatter(wind_angles, cda_vals, c=air_speeds, cmap='viridis', s=100, alpha=0.8, edgecolors='k', linewidth=0.5)
-            if len(set([round(w, 1) for w in wind_angles])) >= 3:
-                co6 = np.polyfit(wind_angles, cda_vals, 2)
-                x6 = np.linspace(-180, 180, 300)
-                ax6.plot(x6, np.poly1d(co6)(x6), color='red', lw=1.5)
-                ax6.text(0.98, 0.05, f"y={co6[0]:.3e}x\u00b2+{co6[1]:.3e}x+{co6[2]:.3e}", transform=ax6.transAxes,
-                         fontsize=7, color='red', ha='right', va='bottom', bbox=dict(facecolor='white', alpha=0.6))
+            _wa = np.array(wind_angles, dtype=float)
+            _cv_wa = np.array(cda_vals, dtype=float)
+            _valid_wa = np.isfinite(_wa) & np.isfinite(_cv_wa)
+            _wa, _cv_wa = _wa[_valid_wa], _cv_wa[_valid_wa]
+            if len(set(round(float(w), 1) for w in _wa)) >= 3 and np.ptp(_wa) > 0:
+                try:
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        co6 = np.polyfit(_wa, _cv_wa, 2)
+                    x6 = np.linspace(-180, 180, 300)
+                    ax6.plot(x6, np.poly1d(co6)(x6), color='red', lw=1.5)
+                    ax6.text(0.98, 0.05, f"y={co6[0]:.3e}x\u00b2+{co6[1]:.3e}x+{co6[2]:.3e}", transform=ax6.transAxes,
+                             fontsize=7, color='red', ha='right', va='bottom', bbox=dict(facecolor='white', alpha=0.6))
+                except Exception:
+                    pass
             for i, sid in enumerate(seg_ids):
                 ax6.annotate(str(sid), (wind_angles[i], cda_vals[i]), xytext=(5, 5), textcoords='offset points', fontsize=6, alpha=0.8)
             ax6.set_title('CdA vs Wind Angle', fontsize=10, fontweight='bold')
@@ -1832,12 +1848,20 @@ class GUIInterface(QMainWindow):
             mask_20 = [abs(y) <= 20 for y in yaw_vals]
             yv20 = [yaw_vals[i] for i in range(len(yaw_vals)) if mask_20[i]]
             cv20 = [cda_vals[i] for i in range(len(cda_vals)) if mask_20[i]]
-            if len(set([round(y, 1) for y in yv20])) >= 5:
-                co = np.polyfit(yv20, cv20, 4)
-                x_fit = np.linspace(-20, 20, 200)
-                ax5.plot(x_fit, np.poly1d(co)(x_fit), color='red', lw=1.5)
-                ax5.text(0.95, 0.05, f"y={co[0]:.3e}x^4+{co[1]:.3e}x^3+{co[2]:.3e}x^2+{co[3]:.3e}x+{co[4]:.3e}", transform=ax5.transAxes,
-                         fontsize=7, color='red', ha='right', va='bottom', bbox=dict(facecolor='white', alpha=0.6))
+            _yv = np.array(yv20, dtype=float)
+            _cv_yaw = np.array(cv20, dtype=float)
+            _valid_yaw = np.isfinite(_yv) & np.isfinite(_cv_yaw)
+            _yv, _cv_yaw = _yv[_valid_yaw], _cv_yaw[_valid_yaw]
+            if len(set(round(float(y), 1) for y in _yv)) >= 5 and np.ptp(_yv) > 0:
+                try:
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        co = np.polyfit(_yv, _cv_yaw, 4)
+                    x_fit = np.linspace(-20, 20, 200)
+                    ax5.plot(x_fit, np.poly1d(co)(x_fit), color='red', lw=1.5)
+                    ax5.text(0.95, 0.05, f"y={co[0]:.3e}x^4+{co[1]:.3e}x^3+{co[2]:.3e}x^2+{co[3]:.3e}x+{co[4]:.3e}", transform=ax5.transAxes,
+                             fontsize=7, color='red', ha='right', va='bottom', bbox=dict(facecolor='white', alpha=0.6))
+                except Exception:
+                    pass
             for i, sid in enumerate(seg_ids):
                 ax5.annotate(str(sid), (yaw_vals[i], cda_vals[i]), xytext=(5, 5), textcoords='offset points', fontsize=6, alpha=0.8)
             ax5.set_title('CdA vs Yaw Angle', fontsize=10, fontweight='bold')
@@ -1851,12 +1875,20 @@ class GUIInterface(QMainWindow):
             # --- 6. CdA vs Wind Angle ---
             ax6 = self.sim_figure.add_subplot(gs[2, 1])
             sc6 = ax6.scatter(wind_angles, cda_vals, c=air_speeds, cmap='viridis', s=100, alpha=0.8, edgecolors='k', linewidth=0.5)
-            if len(set([round(w, 1) for w in wind_angles])) >= 3:
-                co6 = np.polyfit(wind_angles, cda_vals, 2)
-                x6 = np.linspace(-180, 180, 300)
-                ax6.plot(x6, np.poly1d(co6)(x6), color='red', lw=1.5)
-                ax6.text(0.98, 0.05, f"y={co6[0]:.3e}x\u00b2+{co6[1]:.3e}x+{co6[2]:.3e}", transform=ax6.transAxes,
-                         fontsize=7, color='red', ha='right', va='bottom', bbox=dict(facecolor='white', alpha=0.6))
+            _wa = np.array(wind_angles, dtype=float)
+            _cv_wa = np.array(cda_vals, dtype=float)
+            _valid_wa = np.isfinite(_wa) & np.isfinite(_cv_wa)
+            _wa, _cv_wa = _wa[_valid_wa], _cv_wa[_valid_wa]
+            if len(set(round(float(w), 1) for w in _wa)) >= 3 and np.ptp(_wa) > 0:
+                try:
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        co6 = np.polyfit(_wa, _cv_wa, 2)
+                    x6 = np.linspace(-180, 180, 300)
+                    ax6.plot(x6, np.poly1d(co6)(x6), color='red', lw=1.5)
+                    ax6.text(0.98, 0.05, f"y={co6[0]:.3e}x\u00b2+{co6[1]:.3e}x+{co6[2]:.3e}", transform=ax6.transAxes,
+                             fontsize=7, color='red', ha='right', va='bottom', bbox=dict(facecolor='white', alpha=0.6))
+                except Exception:
+                    pass
             for i, sid in enumerate(seg_ids):
                 ax6.annotate(str(sid), (wind_angles[i], cda_vals[i]), xytext=(5, 5), textcoords='offset points', fontsize=6, alpha=0.8)
             ax6.set_title('CdA vs Wind Angle', fontsize=10, fontweight='bold')

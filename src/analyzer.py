@@ -1169,8 +1169,17 @@ class CDAAnalyzer:
                 wind_angles[i] += 360
         
         try:
+            # Filter out NaN/inf pairs and require x-variance before fitting
+            arr_wa = np.array(wind_angles, dtype=float)
+            arr_cda = np.array(cda_vals, dtype=float)
+            valid = np.isfinite(arr_wa) & np.isfinite(arr_cda)
+            arr_wa, arr_cda = arr_wa[valid], arr_cda[valid]
+            if len(arr_wa) < 3 or np.ptp(arr_wa) == 0:
+                self.logger.warning("Insufficient valid data for wind angle coefficient calculation")
+                return None
             # Fit second-order polynomial: cda = a*angle² + b*angle + c
-            coeffs = np.polyfit(wind_angles, cda_vals, 2)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                coeffs = np.polyfit(arr_wa, arr_cda, 2)
             self.logger.info(f"Wind angle coefficients calculated: {coeffs}")
             
             return coeffs.tolist()
