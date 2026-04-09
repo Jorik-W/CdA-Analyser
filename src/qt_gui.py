@@ -1251,6 +1251,8 @@ class GUIInterface(QMainWindow):
                 t.append(f"  Average speed: {ride['average_speed_kmh']:.2f} km/h")
             if ride.get('average_power_w') is not None:
                 t.append(f"  Average power: {ride['average_power_w']:.1f} W")
+            if ride.get('average_heart_rate_bpm') is not None:
+                t.append(f"  Average heart rate: {ride['average_heart_rate_bpm']:.1f} bpm")
             if ride.get('normalized_power_w') is not None:
                 t.append(f"  NP: {ride['normalized_power_w']:.1f} W")
             if ride.get('elevation_gain_m') is not None:

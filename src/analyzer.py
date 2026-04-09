@@ -280,6 +280,7 @@ class CDAAnalyzer:
             total_distance = None
             avg_speed = None
             avg_power = None
+            avg_heart_rate = None
             normalized_power = None
             total_elevation_gain = 0.0
 
@@ -296,6 +297,11 @@ class CDAAnalyzer:
                     # Normalized Power (NP): 30s rolling mean, 4th-power mean, 4th-root.
                     rolling_30s = power_series.rolling(window=30, min_periods=1).mean()
                     normalized_power = float(np.power(np.mean(np.power(rolling_30s, 4)), 0.25))
+
+            if 'heart_rate' in df.columns:
+                hr_series = pd.to_numeric(df['heart_rate'], errors='coerce').dropna()
+                if len(hr_series) > 0:
+                    avg_heart_rate = float(hr_series.mean())
                 
             # Calculate Elevation Gain
             if 'altitude' in df.columns:
@@ -314,6 +320,7 @@ class CDAAnalyzer:
                 'average_speed_mps': round(avg_speed, 2) if avg_speed is not None else None,
                 'average_speed_kmh': round(avg_speed * 3.6, 2) if avg_speed is not None else None,
                 'average_power_w': round(avg_power, 1) if avg_power is not None else None,
+                'average_heart_rate_bpm': round(avg_heart_rate, 1) if avg_heart_rate is not None else None,
                 'normalized_power_w': round(normalized_power, 1) if normalized_power is not None else None,
                 'elevation_gain_m': round(total_elevation_gain, 1) # Added field
             }
