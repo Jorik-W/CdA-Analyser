@@ -437,6 +437,13 @@ class GUIInterface(QMainWindow):
         GNU General Public License v3.0 (GPLv3).<br>
         See the LICENSE file for details.<br><br>
 
+        <b>Icon credit:</b><br>
+        Time Trial Bike icon by
+        <a href='https://www.flaticon.com/authors/izwar-muis'>Izwar Muis</a>
+        from
+        <a href='https://www.flaticon.com/free-icon/time-trial-bike_17736701'>Flaticon</a>
+        (used with attribution).<br><br>
+
         <b>Third-party libraries:</b><br>
         - fitparse (BSD License)<br>
         - folium (MIT License)<br>

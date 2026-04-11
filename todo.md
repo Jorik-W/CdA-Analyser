@@ -1,7 +1,8 @@
-# TODO
+# TODO / Ideas
 
 - [ ] Best Bike Split logic and CdA simulations
-- [ ] Clean CLI outputs
+- [ ] Clean CLI outputs (gui mode)
+- [ ] Test CLI mode (long time not used)
 - [ ] Update About for domoriks (other remote repo)
 - [ ] Move to domoriks remote repo
 - [ ] Scroll plots

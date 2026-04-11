@@ -139,3 +139,8 @@ python -m PyInstaller --onedir --windowed --icon=icons/logo_blue.ico --name="CdA
 ## License
 
 Licensed under GPL-3.0. See [LICENSE](LICENSE).
+
+## Credits
+
+- App icon includes "Time Trial Bike" by [Izwar Muis](https://www.flaticon.com/authors/izwar-muis), from [Flaticon](https://www.flaticon.com/free-icon/time-trial-bike_17736701).
+- Flaticon content is used under the Flaticon license (free for personal and commercial use with attribution).
