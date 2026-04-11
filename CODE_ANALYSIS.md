@@ -1,4 +1,4 @@
-# CdA Analyzer - Current Code Analysis
+﻿# CdA Analyzer - Current Code Analysis
 
 ## Project Overview
 
@@ -24,8 +24,11 @@ Current data flow:
 ```text
 FIT File
   -> FITParser
-     -> unit conversion / distance / altitude preparation
-     -> optional Open-Elevation batch fetch
+    -> unit conversion / distance / altitude_fit preservation
+  -> GUI file-load enrichment
+    -> optional Open-Elevation batch fetch (sampled ~100m + interpolated)
+    -> optional Open-Meteo elevation batch fetch (sampled ~100m + interpolated)
+    -> per-source altitude/slope storage
   -> optional weather prefetch at file load
   -> CDAAnalyzer preprocess
      -> derived metrics
@@ -46,11 +49,11 @@ Primary modules:
 3. src/fit_parser.py - FIT parsing, unit conversion, distance calculation, optional elevation mapping.
 4. src/analyzer.py - Core preprocessing, CdA computation, summary statistics.
 5. src/weather.py - Open-Meteo client and route weather prefetch.
-6. src/elevation.py - Open-Elevation batch client.
+6. src/elevation.py - Open-Elevation and Open-Meteo elevation batch clients.
 7. src/segment_splitter.py - Splits steady segments into analysis sub-segments.
 8. src/qt_gui.py - Main GUI implementation.
 9. src/cli.py - CLI entry point and reporting.
-10. src/gui.py - Legacy Tkinter GUI retained in the repository.
+10. src/gui.py - Legacy Tkinter GUI section kept for historical context (file currently removed).
 11. src/utils.py - Small shared helpers.
 12. scripts/*.py - Standalone utilities.
 13. src/icon.py - Embedded base64 icon asset.
@@ -80,7 +83,7 @@ DEFAULT_PARAMETERS = {
     'drivetrain_loss': 0.0275,
     'wind_effect_factor': 0.40,
     'use_weather_api': True,
-    'use_open_elevation_api': False,
+    'elevation_source': 'open_elevation',
     'weather_sample_distance_m': 3000.0,
 }
 ```
@@ -93,13 +96,14 @@ Important changes versus the older document:
 - Different default drivetrain loss.
 - Higher default wind effect factor.
 - New sub-segment controls.
-- New booleans for weather and elevation API usage.
+- New weather API boolean and analysis elevation source selector.
 - New weather prefetch sampling distance.
 
 API endpoint constants:
 - OPEN_METEO_URL_FORCAST
 - OPEN_METEO_URL_ARCIVE
 - OPEN_ELEVATION_URL
+- OPEN_METEO_ELEVATION_URL
 
 Note:
 - The names FORCAST and ARCIVE are misspelled in code, but used consistently.
@@ -140,7 +144,7 @@ Notable current parameters not described in the old document:
 - subsegment_min_duration_s
 - subsegment_min_points
 - use_weather_api
-- use_open_elevation_api
+- elevation_source
 - weather_sample_distance_m
 
 Observation:
@@ -153,15 +157,14 @@ Observation:
 Purpose:
 - Parse Garmin FIT records into a Pandas DataFrame.
 - Normalize columns.
-- Optionally enrich altitude using Open-Elevation.
+- Preserve FIT-native altitude and core ride channels for later enrichment.
 
 Class:
 - FITParser
 
 Key methods:
-- parse_fit_file(file_path, use_open_elevation_api=False, elevation_service=None, status_callback=None)
-- _process_data(df, use_open_elevation_api=False, elevation_service=None, status_callback=None)
-- apply_open_elevation_to_dataframe(df, elevation_service=None, status_callback=None)
+- parse_fit_file(file_path, status_callback=None)
+- _process_data(df)
 - _calculate_distance(df)
 
 Current behavior:
@@ -171,9 +174,8 @@ Current behavior:
 4. Converts position_lat and position_long from semicircles to degrees.
 5. Converts speed from mm/s to m/s if values are clearly too large.
 6. Preserves FIT altitude in altitude_fit when present.
-7. Optionally applies Open-Elevation and writes altitude_api plus active altitude.
-8. Computes cumulative distance with a vectorized haversine implementation if missing.
-9. Forward/backward fills only safe non-critical columns.
+7. Computes cumulative distance with a vectorized haversine implementation if missing.
+8. Forward/backward fills only safe non-critical columns.
 
 Important current detail:
 - Power and speed are not forward-filled anymore.
@@ -181,13 +183,11 @@ Important current detail:
 
 Elevation handling:
 - elevation_source is tracked on the parser instance.
-- Open-Elevation is skipped when GPS coordinates are missing or invalid.
+- Elevation API calls are handled at GUI load time, not inside the parser.
 - Status messages can be streamed back to the GUI through status_callback.
 
 Open-Elevation integration:
-- Delegates batch retrieval to ElevationService.
-- Uses original (lat, lon) tuples as lookup keys.
-- Writes both altitude_api and active altitude when API data is available.
+- Performed by src/elevation.py and orchestrated by qt_gui.py.
 
 Distance calculation:
 - Uses vectorized NumPy haversine calculations.
@@ -199,21 +199,27 @@ Distance calculation:
 ### 4. src/elevation.py
 
 Purpose:
-- Fetch altitude data from the Open-Elevation API in batches.
+- Fetch altitude data from Open-Elevation and Open-Meteo Elevation APIs in batches.
 
-Class:
+Classes:
 - ElevationService
+- OpenMeteoElevationService
 
 Key methods:
 - _fetch_chunk(coords_chunk, retry_count=0, max_retries=3, status_callback=None)
 - get_elevations_batch(coordinates, chunk_size=500, status_callback=None)
+- apply_to_dataframe(df, status_callback=None)
 
 Behavior:
 - Uses a persistent requests.Session().
-- Sends JSON payloads with coordinate batches.
+- Sends JSON payloads with coordinate batches (Open-Elevation).
+- Sends comma-separated coordinate query params (Open-Meteo).
 - Logs raw API responses through status_callback when provided.
-- Retries on HTTP 429 with exponential backoff.
+- Retries Open-Elevation HTTP 429 with exponential backoff.
 - Retries oversized 413 batches using smaller sub-chunks.
+- Open-Meteo requests are hard-chunked to 100 coordinate pairs per request.
+- Open-Meteo HTTP 429 retries are immediate and deterministic.
+- Route points are sampled ~100 m, fetched, then interpolated back to full distance axis.
 - Returns a dictionary mapping original coordinate tuples to elevation values.
 
 Design detail:
@@ -309,7 +315,7 @@ _calculate_derived_metrics(df) calls:
 - _calculate_acceleration(df)
 
 Slope:
-- Uses altitude.diff() and distance.diff().
+- Uses selected altitude source (open_elevation/open_meteo/fit_only) with fallback chains.
 - Stores degrees in slope_degrees.
 
 Acceleration:
@@ -493,9 +499,8 @@ Current segment result fields can include:
     'inertial_power': float,
     'start_time': Timestamp,
     'end_time': Timestamp,
-    'start_elevation': float | None,
-    'start_elevation_fit': float | None,
-    'start_elevation_api': float | None,
+    'elevation_fit_mean': float | None,
+    'elevation_api_mean': float | None,
     'temperature': float | None,
     'pressure': float | None,
     'wind_speed': float | None,
@@ -524,6 +529,9 @@ _extract_ride_info(df) now returns:
 - average_heart_rate_bpm
 - normalized_power_w
 - elevation_gain_m
+- elevation_min_m
+- elevation_max_m
+- elevation_avg_m
 
 Notes:
 - Timestamps are localized to local wall-clock time through _to_local_time().
@@ -693,6 +701,10 @@ Differences from the old document:
 - CLI now reports explicit ground/wind/air speeds.
 - CLI now reports elevation source and GPS availability.
 
+Known mismatch:
+- CLI currently calls FITParser.parse_fit_file() with an outdated second argument signature.
+- Parser currently accepts (file_path, status_callback=None).
+
 ---
 
 ### 9. src/qt_gui.py
@@ -758,7 +770,8 @@ Important instance state:
 - weather_api_loaded
 - elevation_api_loaded
 - load_weather_api_on_file_load
-- load_elevation_api_on_file_load
+- load_open_elevation_on_file_load
+- load_open_meteo_on_file_load
 - _map_html_path
 
 #### File tab
@@ -766,9 +779,10 @@ Important instance state:
 Features:
 - Browse FIT file.
 - Automatically load after browsing.
-- Two file-load checkboxes:
+- Three file-load checkboxes:
   - weather API on file load
-  - elevation API on file load
+  - Open-Elevation API on file load
+  - Open-Meteo Elevation API on file load
 - About dialog.
 - Status text area with API debug output.
 
@@ -792,6 +806,10 @@ Features:
 - Scrollable parameter form.
 - Boolean parameters rendered as checkboxes.
 - weather_sample_distance_m is intentionally hidden from the form.
+- Elevation Source (Analysis) radio group:
+  - Open-Elevation
+  - Open-Meteo
+  - FIT elevation
 - Run Analysis button.
 
 #### Results tab
@@ -878,13 +896,13 @@ main(argv=None):
 ### 10. src/gui.py
 
 Purpose:
-- Legacy Tkinter GUI retained in the repository.
+- Legacy Tkinter GUI description retained for historical continuity in this document.
 
 Status:
-- Not the primary GUI.
+- File is currently removed from the repository.
 - main.py targets qt_gui.py for GUI mode.
 
-Features still present:
+Historically present features (when the file existed):
 - Splash screen.
 - File, parameter, and results tabs.
 - Threaded analysis.
@@ -898,7 +916,7 @@ Notable differences versus PyQt GUI:
 - No QWebEngine-based inline map.
 - Older UI architecture.
 
-It is best understood as a compatibility or legacy implementation.
+It is best understood as a historical/legacy note.
 
 ---
 
@@ -1123,6 +1141,7 @@ The GUI can load weather for the full ride at file-load time. Analysis then reus
 Altitude can come from:
 - FIT file altitude
 - Open-Elevation API altitude fetched during file load
+- Open-Meteo Elevation API altitude fetched during file load
 
 The active altitude source is selected immediately before analysis in the worker thread.
 
@@ -1196,6 +1215,7 @@ The following code areas existed in the repository but were missing or under-des
 8. Simulation reuse of preprocessed segments in src/qt_gui.py
 9. ride_info enrichment with average power, heart rate, normalized power, and elevation gain
 10. Reload cleanup logic and worker-safety guards in the PyQt GUI
+11. Analysis-time elevation source routing with per-source slope columns
 
 ---
 

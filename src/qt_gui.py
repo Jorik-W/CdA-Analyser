@@ -27,7 +27,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QPushButton, QTextEdit, QLineEdit,
     QFileDialog, QMessageBox, QProgressBar, QScrollArea,
-    QSplashScreen, QGridLayout, QFrame, QDialog, QSlider, QSpinBox, QCheckBox
+    QSplashScreen, QGridLayout, QFrame, QDialog, QSlider, QSpinBox, QCheckBox,
+    QRadioButton, QButtonGroup
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl, QTimer, QRect, QByteArray
 from PyQt5.QtGui import QFont, QIcon, QPixmap, QPainter, QBrush, QLinearGradient, QColor
@@ -38,7 +39,7 @@ from icon import LOGO_BASE64
 from fit_parser import FITParser
 from analyzer import CDAAnalyzer
 from weather import WeatherService
-from elevation import ElevationService
+from elevation import ElevationService, OpenMeteoElevationService
 from config import DEFAULT_PARAMETERS
 
 _CRASH_APP = None
@@ -187,25 +188,54 @@ class WorkerThread(QThread):
         _logger.info(message)
 
     def _prepare_elevation_for_analysis(self):
-        use_api = bool(self.analyzer.parameters.get('use_open_elevation_api', False))
-
-        has_api_altitude = (
-            'altitude_api' in self.ride_data.columns and
-            self.ride_data['altitude_api'].notna().any()
+        elevation_source = self.analyzer.parameters.get('elevation_source', 'open_elevation')
+        
+        has_fit_altitude = (
+            'altitude_fit' in self.ride_data.columns and
+            self.ride_data['altitude_fit'].notna().any()
         )
 
-        if use_api and has_api_altitude:
-            self.ride_data['altitude'] = self.ride_data['altitude_api']
-            self.analyzer.elevation_source = 'Open-Elevation API (fetched at file load)'
-            self._emit_status("Elevation source: Open-Elevation API (fetched at file load)")
-            return
+        has_open_elevation = (
+            'altitude_open_elevation' in self.ride_data.columns and
+            self.ride_data['altitude_open_elevation'].notna().any()
+        )
+        has_open_meteo = (
+            'altitude_open_meteo' in self.ride_data.columns and
+            self.ride_data['altitude_open_meteo'].notna().any()
+        )
 
-        if 'altitude_fit' in self.ride_data.columns:
-            self.ride_data['altitude'] = self.ride_data['altitude_fit']
-        self.analyzer.elevation_source = 'FIT file'
-        if use_api and not has_api_altitude:
-            self._emit_status("Elevation API selected, but no API altitude found for current file load: using FIT altitude")
-        else:
+        if elevation_source in ('open_elevation', 'open_meteo'):
+            if elevation_source == 'open_elevation' and has_open_elevation:
+                self.ride_data['altitude'] = self.ride_data['altitude_open_elevation']
+                self.ride_data['altitude_api'] = self.ride_data['altitude_open_elevation']
+                if 'slope_degrees_open_elevation' in self.ride_data.columns:
+                    self.ride_data['slope_degrees'] = self.ride_data['slope_degrees_open_elevation']
+                source_name = 'Open-Elevation API'
+                self.analyzer.elevation_source = f'{source_name} (fetched at file load)'
+                self._emit_status(f"Elevation source: {source_name} (fetched at file load)")
+            elif elevation_source == 'open_meteo' and has_open_meteo:
+                self.ride_data['altitude'] = self.ride_data['altitude_open_meteo']
+                self.ride_data['altitude_api'] = self.ride_data['altitude_open_meteo']
+                if 'slope_degrees_open_meteo' in self.ride_data.columns:
+                    self.ride_data['slope_degrees'] = self.ride_data['slope_degrees_open_meteo']
+                source_name = 'Open-Meteo Elevation API'
+                self.analyzer.elevation_source = f'{source_name} (fetched at file load)'
+                self._emit_status(f"Elevation source: {source_name} (fetched at file load)")
+            elif has_fit_altitude:
+                self.ride_data['altitude'] = self.ride_data['altitude_fit']
+                if 'slope_degrees_fit' in self.ride_data.columns:
+                    self.ride_data['slope_degrees'] = self.ride_data['slope_degrees_fit']
+                self.analyzer.elevation_source = 'FIT file (API failed)'
+                self._emit_status(f"Elevation API selected, but no altitude data available: using FIT altitude")
+            else:
+                self.analyzer.elevation_source = 'Unknown (no altitude data)'
+                self._emit_status("No elevation data available")
+        else:  # 'fit_only'
+            if has_fit_altitude:
+                self.ride_data['altitude'] = self.ride_data['altitude_fit']
+                if 'slope_degrees_fit' in self.ride_data.columns:
+                    self.ride_data['slope_degrees'] = self.ride_data['slope_degrees_fit']
+            self.analyzer.elevation_source = 'FIT file'
             self._emit_status("Elevation source: FIT file")
 
     def run(self):
@@ -342,7 +372,8 @@ class GUIInterface(QMainWindow):
         self.worker = None
         self._map_html_path = None
         self.load_weather_api_on_file_load = True
-        self.load_elevation_api_on_file_load = True
+        self.load_open_elevation_on_file_load = True
+        self.load_open_meteo_on_file_load = False
         self.weather_api_loaded = False
         self.elevation_api_loaded = False
         self.preloaded_weather_samples = []
@@ -460,9 +491,14 @@ class GUIInterface(QMainWindow):
         self.load_weather_api_checkbox.setChecked(True)
         layout.addWidget(self.load_weather_api_checkbox, 2, 2, 1, 2)
 
-        self.load_elevation_api_checkbox = QCheckBox("Call Elevation API on file load")
-        self.load_elevation_api_checkbox.setChecked(True)
-        layout.addWidget(self.load_elevation_api_checkbox, 2, 4, 1, 2)
+        # Elevation API calls during file load (multiple can be enabled)
+        self.load_open_elevation_checkbox = QCheckBox("Call Open-Elevation API on file load")
+        self.load_open_elevation_checkbox.setChecked(True)
+        layout.addWidget(self.load_open_elevation_checkbox, 2, 4)
+
+        self.load_open_meteo_checkbox = QCheckBox("Call Open-Meteo Elevation API on file load")
+        self.load_open_meteo_checkbox.setChecked(False)
+        layout.addWidget(self.load_open_meteo_checkbox, 2, 5, 1, 2)
 
         # File status (row 3) - expandable
         self.file_status = QTextEdit()
@@ -520,7 +556,7 @@ class GUIInterface(QMainWindow):
 
         self.param_entries = {}
         self.param_checkboxes = {}
-        hidden_parameter_keys = {'weather_sample_distance_m'}
+        hidden_parameter_keys = {'weather_sample_distance_m', 'elevation_source'}
         for key, value in self.parameters.items():
             if key in hidden_parameter_keys:
                 continue
@@ -548,6 +584,39 @@ class GUIInterface(QMainWindow):
 
             row.addStretch()
             scroll_layout.addLayout(row)
+
+        # Analysis elevation source selector (used for CdA calculations)
+        elevation_row = QHBoxLayout()
+        elevation_row.setSpacing(10)
+        elevation_row.setContentsMargins(10, 10, 0, 0)
+
+        elevation_label = QLabel("Elevation Source (Analysis):")
+        elevation_label.setFixedWidth(200)
+        elevation_row.addWidget(elevation_label)
+
+        self.analysis_elevation_source_group = QButtonGroup(self)
+
+        self.analysis_open_elevation_radio = QRadioButton("Open-Elevation")
+        self.analysis_open_meteo_radio = QRadioButton("Open-Meteo")
+        self.analysis_fit_radio = QRadioButton("FIT elevation")
+
+        self.analysis_elevation_source_group.addButton(self.analysis_open_elevation_radio, 0)
+        self.analysis_elevation_source_group.addButton(self.analysis_open_meteo_radio, 1)
+        self.analysis_elevation_source_group.addButton(self.analysis_fit_radio, 2)
+
+        selected_source = str(self.parameters.get('elevation_source', 'open_elevation'))
+        if selected_source == 'open_meteo':
+            self.analysis_open_meteo_radio.setChecked(True)
+        elif selected_source == 'fit_only':
+            self.analysis_fit_radio.setChecked(True)
+        else:
+            self.analysis_open_elevation_radio.setChecked(True)
+
+        elevation_row.addWidget(self.analysis_open_elevation_radio)
+        elevation_row.addWidget(self.analysis_open_meteo_radio)
+        elevation_row.addWidget(self.analysis_fit_radio)
+        elevation_row.addStretch()
+        scroll_layout.addLayout(elevation_row)
 
         scroll_layout.addStretch()
         scroll.setWidget(scroll_content)
@@ -841,35 +910,58 @@ class GUIInterface(QMainWindow):
                 )
 
             use_weather_api_on_load = bool(self.load_weather_api_checkbox.isChecked())
-            use_elevation_api_on_load = bool(self.load_elevation_api_checkbox.isChecked())
+            call_open_elevation_on_load = bool(self.load_open_elevation_checkbox.isChecked())
+            call_open_meteo_on_load = bool(self.load_open_meteo_checkbox.isChecked())
 
             self.weather_api_loaded = False
             self.elevation_api_loaded = False
             self.preloaded_weather_samples = []
 
             fit_parser = FITParser()
-            # Force a fresh API fetch on every file load/reload when enabled.
-            elevation_service = ElevationService() if use_elevation_api_on_load else None
             self.ride_data = fit_parser.parse_fit_file(
                 self.fit_file_path,
-                use_open_elevation_api=use_elevation_api_on_load,
-                elevation_service=elevation_service,
                 status_callback=lambda msg: self.file_status.append(msg),
             )
-            elev_source = fit_parser.elevation_source
-            self.file_status.append(f"Successfully loaded {len(self.ride_data)} data points\n")
 
-            if use_elevation_api_on_load:
-                self.elevation_api_loaded = (
-                    'altitude_api' in self.ride_data.columns and
-                    self.ride_data['altitude_api'].notna().any()
+            # Always preserve FIT altitude source columns
+            if 'altitude_fit' in self.ride_data.columns:
+                self.ride_data['altitude_fit_source'] = self.ride_data['altitude_fit']
+            elif 'altitude' in self.ride_data.columns:
+                self.ride_data['altitude_fit_source'] = self.ride_data['altitude']
+
+            # Startup fetches can include multiple elevation APIs
+            if call_open_elevation_on_load:
+                self.file_status.append("Calling Open-Elevation API on file load...")
+                self._fetch_store_elevation_source(
+                    service=ElevationService(),
+                    source_key='open_elevation',
+                    status_callback=lambda msg: self.file_status.append(msg),
                 )
-                if self.elevation_api_loaded:
-                    self.file_status.append("Elevation API done: fresh altitude fetched for current file\n")
-                else:
-                    self.file_status.append("Elevation API selected but no altitude API data available\n")
-            else:
-                self.file_status.append("Elevation API on load: disabled\n")
+
+            if call_open_meteo_on_load:
+                self.file_status.append("Calling Open-Meteo Elevation API on file load...")
+                self._fetch_store_elevation_source(
+                    service=OpenMeteoElevationService(),
+                    source_key='open_meteo',
+                    status_callback=lambda msg: self.file_status.append(msg),
+                )
+
+            # Determine if at least one API source was fetched
+            has_open_elevation = 'altitude_open_elevation' in self.ride_data.columns and self.ride_data['altitude_open_elevation'].notna().any()
+            has_open_meteo = 'altitude_open_meteo' in self.ride_data.columns and self.ride_data['altitude_open_meteo'].notna().any()
+            self.elevation_api_loaded = bool(has_open_elevation or has_open_meteo)
+
+            # Ensure source-specific slope columns exist
+            self._ensure_source_slopes()
+
+            elev_source = 'FIT file'
+            
+            self.file_status.append(f"Successfully loaded {len(self.ride_data)} data points\n")
+            self.file_status.append(
+                "Elevation load summary: "
+                f"Open-Elevation={'yes' if has_open_elevation else 'no'}, "
+                f"Open-Meteo={'yes' if has_open_meteo else 'no'}, FIT=yes\n"
+            )
 
             if use_weather_api_on_load:
                 self._prefetch_weather_api_on_load()
@@ -887,6 +979,8 @@ class GUIInterface(QMainWindow):
             self.analyzer.allow_runtime_weather_fetch = False
             self.weather_service = WeatherService()
 
+            self._sync_api_parameter_checkbox_state()
+
             self._enable_segment_parameters()
             self._cleanup_results(full_reset=True)
             self.tabs.setCurrentWidget(self.parameters_frame)
@@ -903,6 +997,56 @@ class GUIInterface(QMainWindow):
         in an inconsistent state and cause hard-to-reproduce crashes.
         """
         return not (self.worker is not None and self.worker.isRunning())
+
+    def _calculate_slope_for_column(self, altitude_col, slope_col):
+        """Calculate slope from a specific altitude column and store it."""
+        if self.ride_data is None:
+            return
+        if 'distance' not in self.ride_data.columns or altitude_col not in self.ride_data.columns:
+            return
+
+        distance_diff = self.ride_data['distance'].diff()
+        altitude_diff = self.ride_data[altitude_col].diff()
+        slope_rad = np.where(
+            (distance_diff > 0) & (distance_diff.notna()) & (altitude_diff.notna()),
+            np.arctan2(altitude_diff, distance_diff),
+            0,
+        )
+        self.ride_data[slope_col] = np.degrees(slope_rad)
+
+    def _ensure_source_slopes(self):
+        """Ensure slopes are available for each elevation source column."""
+        if self.ride_data is None:
+            return
+
+        if 'altitude_fit' in self.ride_data.columns:
+            self._calculate_slope_for_column('altitude_fit', 'slope_degrees_fit')
+        elif 'altitude' in self.ride_data.columns:
+            self.ride_data['altitude_fit'] = self.ride_data['altitude'].copy()
+            self._calculate_slope_for_column('altitude_fit', 'slope_degrees_fit')
+
+        if 'altitude_open_elevation' in self.ride_data.columns:
+            self._calculate_slope_for_column('altitude_open_elevation', 'slope_degrees_open_elevation')
+
+        if 'altitude_open_meteo' in self.ride_data.columns:
+            self._calculate_slope_for_column('altitude_open_meteo', 'slope_degrees_open_meteo')
+
+    def _fetch_store_elevation_source(self, service, source_key, status_callback=None):
+        """Fetch one elevation API source and store source-specific columns."""
+        if self.ride_data is None:
+            return
+
+        df_source, _ = service.apply_to_dataframe(
+            self.ride_data.copy(),
+            status_callback=status_callback,
+        )
+
+        source_col = f'altitude_{source_key}'
+        if 'altitude_api' in df_source.columns:
+            self.ride_data[source_col] = df_source['altitude_api']
+
+            # Keep legacy field pointing to last fetched API for backward compatibility
+            self.ride_data['altitude_api'] = df_source['altitude_api']
 
     def _clear_all_loaded_data_for_reload(self):
         """Clear all cached ride, segment, analysis, and API-derived state.
@@ -976,11 +1120,23 @@ class GUIInterface(QMainWindow):
             for key, checkbox in self.param_checkboxes.items():
                 self.parameters[key] = checkbox.isChecked()
 
-            # Persist file-load API selection checkboxes.
+            # Persist file-load weather API checkbox
             if hasattr(self, 'load_weather_api_checkbox'):
                 self.load_weather_api_on_file_load = self.load_weather_api_checkbox.isChecked()
-            if hasattr(self, 'load_elevation_api_checkbox'):
-                self.load_elevation_api_on_file_load = self.load_elevation_api_checkbox.isChecked()
+            if hasattr(self, 'load_open_elevation_checkbox'):
+                self.load_open_elevation_on_file_load = self.load_open_elevation_checkbox.isChecked()
+            if hasattr(self, 'load_open_meteo_checkbox'):
+                self.load_open_meteo_on_file_load = self.load_open_meteo_checkbox.isChecked()
+            
+            # Save analysis elevation source from parameters tab radio buttons
+            if hasattr(self, 'analysis_elevation_source_group'):
+                selected_id = self.analysis_elevation_source_group.checkedId()
+                if selected_id == 0:
+                    self.parameters['elevation_source'] = 'open_elevation'
+                elif selected_id == 1:
+                    self.parameters['elevation_source'] = 'open_meteo'
+                elif selected_id == 2:
+                    self.parameters['elevation_source'] = 'fit_only'
             
             # Update slider if wind_effect_factor changed
             if 'wind_effect_factor' in self.parameters:
@@ -994,14 +1150,8 @@ class GUIInterface(QMainWindow):
             QMessageBox.critical(self, "Error", f"Error saving parameters: {str(e)}")
 
     def _sync_api_parameter_checkbox_state(self):
-        """Keep API parameter checkboxes enabled and add availability hints.
-
-        These checkboxes are calculation switches and should stay user-controllable
-        even when no API data was fetched at file load.
-        """
+        """Sync parameter controls based on what data was loaded at file start."""
         weather_key = 'use_weather_api'
-        elevation_key = 'use_open_elevation_api'
-
         if weather_key in self.param_checkboxes:
             checkbox = self.param_checkboxes[weather_key]
             checkbox.setEnabled(True)
@@ -1010,13 +1160,51 @@ class GUIInterface(QMainWindow):
             else:
                 checkbox.setToolTip("No weather API data fetched at file load; calculation falls back to no wind")
 
-        if elevation_key in self.param_checkboxes:
-            checkbox = self.param_checkboxes[elevation_key]
-            checkbox.setEnabled(True)
-            if self.elevation_api_loaded:
-                checkbox.setToolTip("Elevation API data fetched at file load and available")
+        # Enable/disable analysis elevation source radios based on available loaded columns
+        if hasattr(self, 'analysis_open_elevation_radio') and self.ride_data is not None:
+            has_open_elevation = bool(
+                'altitude_open_elevation' in self.ride_data.columns and
+                self.ride_data['altitude_open_elevation'].notna().any()
+            )
+            has_open_meteo = bool(
+                'altitude_open_meteo' in self.ride_data.columns and
+                self.ride_data['altitude_open_meteo'].notna().any()
+            )
+            has_fit = bool(
+                'altitude_fit' in self.ride_data.columns and
+                self.ride_data['altitude_fit'].notna().any()
+            )
+
+            self.analysis_open_elevation_radio.setEnabled(has_open_elevation)
+            self.analysis_open_meteo_radio.setEnabled(has_open_meteo)
+            self.analysis_fit_radio.setEnabled(has_fit)
+
+            self.analysis_open_elevation_radio.setToolTip(
+                "Enabled: Open-Elevation loaded at file start" if has_open_elevation else "Disabled: Open-Elevation not loaded at file start"
+            )
+            self.analysis_open_meteo_radio.setToolTip(
+                "Enabled: Open-Meteo loaded at file start" if has_open_meteo else "Disabled: Open-Meteo not loaded at file start"
+            )
+            self.analysis_fit_radio.setToolTip(
+                "Enabled: FIT elevation is available" if has_fit else "Disabled: FIT elevation unavailable"
+            )
+
+            # If selected source is unavailable, fallback to FIT, then available API source
+            selected = self.parameters.get('elevation_source', 'open_elevation')
+            if selected == 'open_elevation' and not has_open_elevation:
+                self.parameters['elevation_source'] = 'fit_only' if has_fit else ('open_meteo' if has_open_meteo else 'open_elevation')
+            elif selected == 'open_meteo' and not has_open_meteo:
+                self.parameters['elevation_source'] = 'fit_only' if has_fit else ('open_elevation' if has_open_elevation else 'open_meteo')
+            elif selected == 'fit_only' and not has_fit:
+                self.parameters['elevation_source'] = 'open_elevation' if has_open_elevation else 'open_meteo'
+
+            selected = self.parameters.get('elevation_source', 'open_elevation')
+            if selected == 'open_meteo':
+                self.analysis_open_meteo_radio.setChecked(True)
+            elif selected == 'fit_only':
+                self.analysis_fit_radio.setChecked(True)
             else:
-                checkbox.setToolTip("No elevation API data fetched at file load; calculation falls back to FIT altitude")
+                self.analysis_open_elevation_radio.setChecked(True)
 
     def _prefetch_weather_api_on_load(self):
         """Prefetch weather data for the full route at 3km local-time intervals."""
@@ -1274,8 +1462,11 @@ class GUIInterface(QMainWindow):
 
         t.append(f"Segment Analysis ({len(r['segments'])} steady segments found):")
         t.append("-" * 250)
-        use_api = self.parameters.get('use_open_elevation_api', False)
-        if use_api:
+        elevation_source = self.parameters.get('elevation_source', 'open_elevation')
+        # Always show both elevation columns if we have API data
+        has_api_elevation = any(s.get('elevation_api_mean') is not None for s in r['segments'])
+        
+        if has_api_elevation:
             t.append(f"{'ID':<3}\t{'Dur':>6}\t{'Dist':>8}\t{'Elev FIT':>8}\t{'Elev API':>8}\t{'v_g':>6}\t{'v_w':>7}\t{'v_a':>6}\t{'w_angle':>6}\t{'Yaw':>5}\t{'Slope':>6}\t{'Power':>6}\t{'CdA':>7}")
             t.append(f"{'':3}\t{'(s)':>6}\t{'(m)':>8}\t{'(m)':>8}\t{'(m)':>8}\t{'m/s':>6}\t{'m/s':>7}\t{'m/s':>6}\t{'(deg)':>6}\t{'(deg)':>5}\t{'(deg)':>6}\t{'(W)':>6}\t{'':>7}")
         else:
@@ -1287,16 +1478,19 @@ class GUIInterface(QMainWindow):
             # Use precomputed yaw from analyzer
             yaw = s.get('yaw', 0.0)
             
-            if use_api:
-                fit_str = f"{s['start_elevation_fit']:>8.0f}" if s.get('start_elevation_fit') is not None else f"{'N/A':>8}"
-                api_str = f"{s['start_elevation_api']:>8.0f}" if s.get('start_elevation_api') is not None else f"{'N/A':>8}"
+            if has_api_elevation:
+                fit_elev = s.get('elevation_fit_mean')
+                api_elev = s.get('elevation_api_mean')
+                fit_str = f"{fit_elev:>8.0f}" if fit_elev is not None else f"{'N/A':>8}"
+                api_str = f"{api_elev:>8.0f}" if api_elev is not None else f"{'N/A':>8}"
                 t.append(
                     f"{s['segment_id']:<3}\t{s['duration']:>6.0f}\t{s['distance']:>8.0f}\t"
                     f"{fit_str}\t{api_str}\t{s.get('v_ground', s['speed']):>6.2f}\t{s.get('v_wind', s['effective_wind']):>+7.2f}\t{s.get('v_air', s['air_speed']):>6.2f}\t"
                     f"{s['wind_angle']:>6.0f}\t{yaw:>5.1f}\t{s['slope']:>6.1f}\t{s['power']:>6.0f}\t{s['cda']:>7.4f}"
                 )
             else:
-                elev_str = f"{s['start_elevation']:>6.0f}" if s.get('start_elevation') is not None else f"{'N/A':>6}"
+                elev = s.get('elevation_fit_mean') if s.get('elevation_fit_mean') is not None else 0
+                elev_str = f"{elev:>6.0f}" if elev is not None else f"{'N/A':>6}"
                 t.append(
                     f"{s['segment_id']:<3}\t{s['duration']:>6.0f}\t{s['distance']:>8.0f}\t"
                     f"{elev_str}\t{s.get('v_ground', s['speed']):>6.2f}\t{s.get('v_wind', s['effective_wind']):>+7.2f}\t{s.get('v_air', s['air_speed']):>6.2f}\t"
@@ -1729,11 +1923,11 @@ class GUIInterface(QMainWindow):
         t.append(f"  Pressure: {pressure:.2f}\n")
 
         # --- Segment Table Header ---
-        use_api = self.parameters.get('use_open_elevation_api', False)
+        has_api_elevation = any(s.get('elevation_api_mean') is not None for s in self.simulation_results)
         has_gps = 'latitude' in self.ride_data.columns if self.ride_data is not None else False
         t.append(f"Segment Results ({len(self.simulation_results)} segments):")
         t.append("-" * 250)
-        if use_api:
+        if has_api_elevation:
             t.append(f"{'ID':<3}\t{'Dur':>6}\t{'Dist':>8}\t{'Elev FIT':>8}\t{'Elev API':>8}\t{'v_g':>6}\t{'v_w':>7}\t{'v_a':>6}\t"
                     f"{'w_angle':>6}\t{'Yaw':>5}\t{'Slope':>6}\t{'Power':>6}\t{'CdA':>7}")
             t.append(f"{'':3}\t{'(s)':>6}\t{'(m)':>8}\t{'(m)':>8}\t{'(m)':>8}\t{'m/s':>6}\t{'m/s':>7}\t{'m/s':>6}\t"
@@ -1750,16 +1944,19 @@ class GUIInterface(QMainWindow):
             # Use precomputed yaw from analyzer
             yaw = s.get('yaw', 0.0)
             
-            if use_api:
-                fit_str = f"{s['start_elevation_fit']:>8.0f}" if s.get('start_elevation_fit') is not None else f"{'N/A':>8}"
-                api_str = f"{s['start_elevation_api']:>8.0f}" if s.get('start_elevation_api') is not None else f"{'N/A':>8}"
+            if has_api_elevation:
+                fit_elev = s.get('elevation_fit_mean')
+                api_elev = s.get('elevation_api_mean')
+                fit_str = f"{fit_elev:>8.0f}" if fit_elev is not None else f"{'N/A':>8}"
+                api_str = f"{api_elev:>8.0f}" if api_elev is not None else f"{'N/A':>8}"
                 t.append(
                     f"{s['segment_id']:<3}\t{s['duration']:>6.0f}\t{s['distance']:>8.0f}\t"
                     f"{fit_str}\t{api_str}\t{s.get('v_ground', s['speed']):>6.2f}\t{s.get('v_wind', s['effective_wind']):>+7.2f}\t{s.get('v_air', s['air_speed']):>6.2f}\t"
                     f"{s['wind_angle']:>6.0f}\t{yaw:>5.1f}\t{s['slope']:>6.1f}\t{s['power']:>6.0f}\t{s['cda']:>7.4f}"
                 )
             else:
-                elev_str = f"{s['start_elevation']:>6.0f}" if s.get('start_elevation') is not None else f"{'N/A':>6}"
+                fit_elev = s.get('elevation_fit_mean')
+                elev_str = f"{fit_elev:>6.0f}" if fit_elev is not None else f"{'N/A':>6}"
                 t.append(
                     f"{s['segment_id']:<3}\t{s['duration']:>6.0f}\t{s['distance']:>8.0f}\t"
                     f"{elev_str}\t{s.get('v_ground', s['speed']):>6.2f}\t{s.get('v_wind', s['effective_wind']):>+7.2f}\t{s.get('v_air', s['air_speed']):>6.2f}\t"

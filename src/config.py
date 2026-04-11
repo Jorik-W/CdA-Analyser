@@ -20,7 +20,7 @@ DEFAULT_PARAMETERS = {
     'drivetrain_loss': 0.0275,
     'wind_effect_factor' : 0.40, # (0.0 - 1.0)  look at cli angle +- 0 and angle 180 must be 0 -> +-0.20 cda diff +  CdA standard deviation < 0.05
     'use_weather_api': True,  # Use weather API data in calculations when data is available
-    'use_open_elevation_api': False,  # Use Open-Elevation API for altitude data (batch request, all points in 1 call)
+    'elevation_source': 'open_elevation',  # 'open_elevation', 'open_meteo', or 'fit_only'
     'weather_sample_distance_m': 3000.0,  # Distance-based weather samples loaded at FIT import
 
     # Sub-segment splitting: each steady segment is divided into chunks so that
@@ -34,6 +34,7 @@ OPEN_METEO_URL_ARCIVE  = "https://archive-api.open-meteo.com/v1/archive"
 
 # Elevation API settings
 OPEN_ELEVATION_URL = "https://api.open-elevation.com/api/v1/lookup"
+OPEN_METEO_ELEVATION_URL = "https://api.open-meteo.com/v1/elevation"
 
 """
 Eeklo

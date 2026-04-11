@@ -221,6 +221,20 @@ class CDAAnalyzer:
             'inertial_power': wavg('inertial_power'),
         }
 
+        # Calculate elevation means from the full segment
+        elevation_fit_mean = None
+        elevation_api_mean = None
+        
+        if 'altitude_fit' in segment_df.columns:
+            fit_altitudes = segment_df['altitude_fit'].dropna()
+            if len(fit_altitudes) > 0:
+                elevation_fit_mean = float(fit_altitudes.mean())
+        
+        if 'altitude_api' in segment_df.columns:
+            api_altitudes = segment_df['altitude_api'].dropna()
+            if len(api_altitudes) > 0:
+                elevation_api_mean = float(api_altitudes.mean())
+
         residual = self._calculate_residual(
             averages,
             final_cda,
@@ -243,7 +257,7 @@ class CDAAnalyzer:
         # Weight-average the yaw values (circular mean not needed for yaw since it's typically small)
         avg_yaw = float(np.average(yaw_angles, weights=weights)) if yaw_angles else 0.0
 
-        return {
+        result = {
             'cda':          final_cda,
             'cda_std':      cda_std,
             'cda_points':   total_pts,
@@ -263,6 +277,14 @@ class CDAAnalyzer:
             'subsegments':  sub_results,
             **averages,
         }
+        
+        # Add elevation data if available
+        if elevation_fit_mean is not None:
+            result['elevation_fit_mean'] = elevation_fit_mean
+        if elevation_api_mean is not None:
+            result['elevation_api_mean'] = elevation_api_mean
+        
+        return result
     
     # ============ Data Preparation Methods ============
 
@@ -283,6 +305,9 @@ class CDAAnalyzer:
             avg_heart_rate = None
             normalized_power = None
             total_elevation_gain = 0.0
+            min_elevation = None
+            max_elevation = None
+            avg_elevation = None
 
             if 'distance' in df.columns:
                 total_distance = df['distance'].iloc[-1] - df['distance'].iloc[0]
@@ -303,14 +328,21 @@ class CDAAnalyzer:
                 if len(hr_series) > 0:
                     avg_heart_rate = float(hr_series.mean())
                 
-            # Calculate Elevation Gain
+            # Calculate Elevation Gain and min/max
             if 'altitude' in df.columns:
                 # Calculate difference between consecutive points
                 alt_diffs = df['altitude'].diff().dropna()
                 # Sum only positive differences (climbing)
                 total_elevation_gain = alt_diffs[alt_diffs > 0].sum()
+                
+                # Get min, max, average elevation
+                altitude_series = df['altitude'].dropna()
+                if len(altitude_series) > 0:
+                    min_elevation = float(altitude_series.min())
+                    max_elevation = float(altitude_series.max())
+                    avg_elevation = float(altitude_series.mean())
 
-            return {
+            ride_info = {
                 'date': start_time.date(),
                 'start_time': start_time,
                 'end_time': end_time,
@@ -322,8 +354,18 @@ class CDAAnalyzer:
                 'average_power_w': round(avg_power, 1) if avg_power is not None else None,
                 'average_heart_rate_bpm': round(avg_heart_rate, 1) if avg_heart_rate is not None else None,
                 'normalized_power_w': round(normalized_power, 1) if normalized_power is not None else None,
-                'elevation_gain_m': round(total_elevation_gain, 1) # Added field
+                'elevation_gain_m': round(total_elevation_gain, 1)
             }
+            
+            # Add optional elevation statistics if available
+            if min_elevation is not None:
+                ride_info['elevation_min_m'] = round(min_elevation, 1)
+            if max_elevation is not None:
+                ride_info['elevation_max_m'] = round(max_elevation, 1)
+            if avg_elevation is not None:
+                ride_info['elevation_avg_m'] = round(avg_elevation, 1)
+            
+            return ride_info
 
     @staticmethod
     def _to_local_time(timestamp):
@@ -344,24 +386,66 @@ class CDAAnalyzer:
         self.logger.debug("Calculating derived metrics")
         df = df.copy()
         
-        df = self._calculate_slope(df)
+        # Get elevation source from parameters, with fallback
+        elevation_source_param = self.parameters.get('elevation_source', 'open_elevation')
+        df = self._calculate_slope(df, elevation_source=elevation_source_param)
         df = self._calculate_acceleration(df)
         
         return df
     
-    def _calculate_slope(self, df):
-        """Calculate slope from altitude and distance data"""
-        if 'altitude' in df.columns and 'distance' in df.columns:
-            distance_diff = df['distance'].diff()
-            altitude_diff = df['altitude'].diff()
-            
-            slope_rad = np.where(
-                (distance_diff > 0) & (distance_diff.notna()) & (altitude_diff.notna()),
-                np.arctan2(altitude_diff, distance_diff), 
-                0
-            )
-            df['slope_degrees'] = np.degrees(slope_rad)
-            self.logger.debug(f"Calculated slope for {len(df)} points")
+    def _calculate_slope(self, df, elevation_source='open_elevation'):
+        """Calculate slope from altitude and distance data, using specified elevation source.
+        
+        Args:
+            df (DataFrame): Ride data
+            elevation_source (str): 'open_elevation', 'open_meteo', or 'fit_only'
+        
+        Returns:
+            DataFrame: Data with calculated 'slope_degrees' column
+        """
+        if 'distance' not in df.columns:
+            return df
+        
+        # Select altitude column based on source
+        altitude_col = None
+        if elevation_source == 'open_elevation':
+            if 'altitude_open_elevation' in df.columns and df['altitude_open_elevation'].notna().any():
+                altitude_col = 'altitude_open_elevation'
+            elif 'altitude_api' in df.columns and df['altitude_api'].notna().any():
+                altitude_col = 'altitude_api'
+            elif 'altitude_fit' in df.columns:
+                altitude_col = 'altitude_fit'
+            elif 'altitude' in df.columns:
+                altitude_col = 'altitude'
+        elif elevation_source == 'open_meteo':
+            if 'altitude_open_meteo' in df.columns and df['altitude_open_meteo'].notna().any():
+                altitude_col = 'altitude_open_meteo'
+            elif 'altitude_api' in df.columns and df['altitude_api'].notna().any():
+                altitude_col = 'altitude_api'
+            elif 'altitude_fit' in df.columns:
+                altitude_col = 'altitude_fit'
+            elif 'altitude' in df.columns:
+                altitude_col = 'altitude'
+        else:  # 'fit_only'
+            if 'altitude_fit' in df.columns:
+                altitude_col = 'altitude_fit'
+            elif 'altitude' in df.columns:
+                altitude_col = 'altitude'
+        
+        if altitude_col is None:
+            self.logger.warning(f"No altitude column found for slope calculation (source={elevation_source})")
+            return df
+        
+        distance_diff = df['distance'].diff()
+        altitude_diff = df[altitude_col].diff()
+        
+        slope_rad = np.where(
+            (distance_diff > 0) & (distance_diff.notna()) & (altitude_diff.notna()),
+            np.arctan2(altitude_diff, distance_diff), 
+            0
+        )
+        df['slope_degrees'] = np.degrees(slope_rad)
+        self.logger.debug(f"Calculated slope for {len(df)} points using {altitude_col} (source={elevation_source})")
         
         return df
     
@@ -1300,6 +1384,10 @@ class CDAAnalyzer:
         wind_speeds = [s['wind_speed'] for s in segment_results if 'wind_speed' in s]
         temperatures = [s['temperature'] for s in segment_results if 'temperature' in s]
         pressures = [s['pressure'] for s in segment_results if 'pressure' in s]
+        
+        # Collect elevation statistics (both FIT and API sources)
+        elevation_fit_means = [s['elevation_fit_mean'] for s in segment_results if 'elevation_fit_mean' in s]
+        elevation_api_means = [s['elevation_api_mean'] for s in segment_results if 'elevation_api_mean' in s]
 
         summary = {
             'total_segments': len(segment_results),
@@ -1329,6 +1417,17 @@ class CDAAnalyzer:
             'elevation_source': self.elevation_source,
             'has_gps_coordinates': False  # Set in analyze_ride from input data
         }
+        
+        # Add elevation statistics if available
+        if elevation_fit_means:
+            summary['elevation_min_m'] = float(np.min(elevation_fit_means))
+            summary['elevation_max_m'] = float(np.max(elevation_fit_means))
+            summary['elevation_avg_m'] = float(np.mean(elevation_fit_means))
+        
+        if elevation_api_means:
+            summary['elevation_api_min_m'] = float(np.min(elevation_api_means))
+            summary['elevation_api_max_m'] = float(np.max(elevation_api_means))
+            summary['elevation_api_avg_m'] = float(np.mean(elevation_api_means))
         
         self.logger.debug(
             f"Summary calculated: weighted_all={weighted_cda_all:.4f}, "
