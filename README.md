@@ -4,7 +4,7 @@
 	<img src="src/icons/logo.PNG" alt="CdA Analyser logo" width="140">
 </p>
 
-Estimate cycling aerodynamic drag area (CdA) from FIT ride files using a steady-segment pipeline with weather and elevation support.
+Estimate cycling aerodynamic drag area (CdA) from FIT ride files using segment-based approach with weather and elevation taken in to account. 
 
 ## What It Does
 
